@@ -186,6 +186,21 @@ pub enum OpenWhoopCommand {
         output_dir: String,
     },
     ///
+    /// Run the alarm scheduler (runs on AWS with remote database)
+    /// Checks cron schedules and queues commands when laptop is offline
+    ///
+    Scheduler {
+        /// Interval in seconds between scheduler checks (default: 60)
+        #[arg(long, default_value_t = 60)]
+        interval_secs: u64,
+        /// Device ID to manage alarms for
+        #[arg(long, env)]
+        device_id: String,
+        /// URL of the live-server to send commands to
+        #[arg(long, default_value = "http://127.0.0.1:3848")]
+        studio_url: String,
+    },
+    ///
     /// Agent CLI: control Whoop via HTTP API (requires live-server running)
     ///
     Agent {
@@ -542,6 +557,9 @@ impl OpenWhoopCli {
 
         match self.subcommand {
             OpenWhoopCommand::Scan | OpenWhoopCommand::Completions { .. } => {
+                unreachable!("handled before database init")
+            }
+            OpenWhoopCommand::Scheduler { .. } => {
                 unreachable!("handled before database init")
             }
             OpenWhoopCommand::DownloadHistory { whoop } => {
@@ -926,6 +944,14 @@ impl OpenWhoopCli {
             OpenWhoopCommand::DownloadFirmware { .. } => {
                 unreachable!("handled before BLE/DB init")
             }
+            OpenWhoopCommand::Scheduler { interval_secs, device_id, studio_url } => {
+                let db_url = self.database_url.as_deref().ok_or_else(|| {
+                    anyhow!("DATABASE_URL is required for scheduler")
+                })?;
+                let db = DatabaseHandler::new(db_url).await;
+                Self::run_scheduler(interval_secs, &device_id, &studio_url, db).await?;
+                return Ok(());
+            }
             OpenWhoopCommand::Agent { ref command } => {
                 self.run_agent_command(command.clone()).await?;
             }
@@ -1110,6 +1136,70 @@ impl OpenWhoopCli {
             }
         }
         Ok(())
+    }
+
+    async fn run_scheduler(interval_secs: u64, device_id: &str, studio_url: &str, db_handler: DatabaseHandler) -> anyhow::Result<()> {
+        info!("Starting scheduler (interval: {}s, device: {}, studio: {})", interval_secs, device_id, studio_url);
+        
+        let client = reqwest::Client::new();
+        
+        loop {
+            let now_unix = Utc::now().timestamp();
+            
+            // Check for due alarms in the database
+            let due_alarms = db_handler.advance_due_alarm_schedules(now_unix).await?;
+            
+            for (schedule_id, next_unix) in due_alarms {
+                // Queue the alarm command
+                let payload = serde_json::json!({ "unix": next_unix, "schedule_id": schedule_id });
+                let _ = db_handler.push_command(device_id, "set-alarm", Some(payload)).await;
+                info!("Queued alarm for schedule {} at unix {}", schedule_id, next_unix);
+            }
+            
+            // Try to process pending queue (send to live-server)
+            let pending = db_handler.list_pending_commands(device_id).await?;
+            if !pending.is_empty() {
+                for cmd in &pending {
+                    let result = match cmd.command_type.as_str() {
+                        "set-alarm" => {
+                            if let Some(payload) = &cmd.payload {
+                                if let Some(unix) = payload.get("unix").and_then(|v| v.as_u64()) {
+                                    client.post(format!("{}/api/device/alarm", studio_url))
+                                        .json(&serde_json::json!({ "unix": u32::try_from(unix)? }))
+                                        .send()
+                                        .await
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                        "buzzer" => client.post(format!("{}/api/device/buzzer", studio_url)).send().await,
+                        "clear-alarm" => client.post(format!("{}/api/device/alarm/clear", studio_url)).send().await,
+                        _ => continue,
+                    };
+                    
+                    match result {
+                        Ok(resp) if resp.status().is_success() => {
+                            db_handler.mark_command_sent(cmd.id).await?;
+                            info!("Sent command {} to live-server", cmd.command_type);
+                        }
+                        Ok(resp) => {
+                            let err = format!("HTTP {}", resp.status());
+                            db_handler.mark_command_failed(cmd.id, &err).await?;
+                            warn!("Failed to send command {}: {}", cmd.command_type, err);
+                        }
+                        Err(e) => {
+                            db_handler.mark_command_failed(cmd.id, &e.to_string()).await?;
+                            warn!("Error sending command {}: {}", cmd.command_type, e);
+                        }
+                    }
+                }
+            }
+            
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        }
     }
 
     async fn create_ble_adapter(&self) -> anyhow::Result<Adapter> {

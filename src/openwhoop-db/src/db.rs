@@ -293,7 +293,8 @@ impl DatabaseHandler {
     }
 
     /// Mark all due schedules as rang and compute each schedule's next trigger.
-    pub async fn advance_due_alarm_schedules(&self, now_unix: i64) -> anyhow::Result<()> {
+    /// Returns the IDs and next_unix values of schedules that were triggered.
+    pub async fn advance_due_alarm_schedules(&self, now_unix: i64) -> anyhow::Result<Vec<(i32, i64)>> {
         let due = alarm_schedules::Entity::find()
             .filter(alarm_schedules::Column::Enabled.eq(true))
             .filter(alarm_schedules::Column::NextUnix.lte(now_unix))
@@ -301,7 +302,11 @@ impl DatabaseHandler {
             .all(&self.db)
             .await?;
 
+        let mut triggered = Vec::new();
         for mut s in due {
+            let next_unix = s.next_unix;
+            triggered.push((s.id, next_unix.unwrap_or(now_unix)));
+            
             s.last_rang_unix = Some(now_unix);
             s.next_unix = match s.kind.as_str() {
                 "once" => {
@@ -321,7 +326,7 @@ impl DatabaseHandler {
             let am: alarm_schedules::ActiveModel = s.into();
             let _ = am.update(&self.db).await?;
         }
-        Ok(())
+        Ok(triggered)
     }
 
     /// Update schedule row(s) when strap alarm fired.
