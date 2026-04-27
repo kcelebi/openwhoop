@@ -570,10 +570,6 @@ impl OpenWhoopCli {
             OpenWhoopCommand::DownloadFirmware { .. } => {
                 unreachable!("handled before database init")
             }
-            #[allow(unreachable_patterns)]
-            OpenWhoopCommand::LiveServer { .. } => {
-                unreachable!("handled before database init")
-            }
             OpenWhoopCommand::DownloadHistory { whoop } => {
                 let peripheral = scan_command(&adapter, Some(whoop)).await?;
                 let mut whoop =
