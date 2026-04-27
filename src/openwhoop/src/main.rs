@@ -968,6 +968,19 @@ impl OpenWhoopCli {
             .unwrap_or_else(|_| "http://127.0.0.1:3848".to_string());
         let client = reqwest::Client::new();
 
+        // Connection check - verify studio is reachable before sending commands
+        match client.get(format!("{}/health", studio_url)).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!("Connected to live-server at {}", studio_url);
+            }
+            Ok(resp) => {
+                anyhow::bail!("live-server at {} returned HTTP {}", studio_url, resp.status());
+            }
+            Err(e) => {
+                anyhow::bail!("Cannot reach live-server at {}: {}. Is it running with OPENWHOOP_STUDIO_BIND=0.0.0.0?", studio_url, e);
+            }
+        };
+
         match command {
             AgentCommand::Buzzer => {
                 let resp = client.post(format!("{}/api/device/buzzer", studio_url))
@@ -1080,6 +1093,22 @@ impl OpenWhoopCli {
             }
             QueueCommand::Process { device_id, studio_url } => {
                 let url = studio_url.unwrap_or_else(|| "http://127.0.0.1:3848".to_string());
+                
+                // Connection check before processing queue
+                let client = reqwest::Client::new();
+                match client.get(format!("{}/health", url)).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        info!("Connected to live-server at {}", url);
+                    }
+                    Ok(resp) => {
+                        println!("Warning: live-server at {} returned HTTP {}", url, resp.status());
+                    }
+                    Err(e) => {
+                        println!("Warning: Cannot reach live-server at {}: {}", url, e);
+                        println!("Commands will remain queued until connection is restored.");
+                    }
+                }
+                
                 let pending = db.list_pending_commands(&device_id).await?;
                 
                 if pending.is_empty() {
@@ -1088,7 +1117,6 @@ impl OpenWhoopCli {
                 }
 
                 println!("Processing {} pending commands for device '{}'...", pending.len(), device_id);
-                let client = reqwest::Client::new();
                 
                 for cmd in pending {
                     let result = match cmd.command_type.as_str() {
