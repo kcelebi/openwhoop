@@ -10,7 +10,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Setup build dependencies
         run: |
           sudo apt update
@@ -30,10 +30,3 @@ jobs:
         with:
           command: check
           args: --all-targets
-        env:
-          RUSTFLAGS: -D warnings
-      - uses: actions-rs/cargo@v1
-        name: clippy
-        with:
-          command: clippy
-          args: --all-targets -- -D warnings

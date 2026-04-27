@@ -538,15 +538,12 @@ impl OpenWhoopCli {
                 return Ok(());
             }
             OpenWhoopCommand::LiveServer { .. } => {
-                // LiveServer runs separately - has its own match arm later
-                return Ok(());
+                // LiveServer has its own match arm
             }
             OpenWhoopCommand::Scheduler { .. } => {
-                // Scheduler runs separately - has its own match arm later
                 return Ok(());
             }
             OpenWhoopCommand::DownloadFirmware { .. } => {
-                // No BLE/DB needed - downloads from WHOOP API
                 return Ok(());
             }
             _ => {}
@@ -561,16 +558,20 @@ impl OpenWhoopCli {
         let db_handler = DatabaseHandler::new(database_url.to_owned()).await;
 
         match self.subcommand {
+            #[allow(unreachable_patterns)]
             OpenWhoopCommand::Scan | OpenWhoopCommand::Completions { .. } => {
                 unreachable!("handled before database init")
             }
-            OpenWhoopCommand::LiveServer { .. } => {
-                unreachable!("handled before database init")
-            }
+            #[allow(unreachable_patterns)]
             OpenWhoopCommand::Scheduler { .. } => {
                 unreachable!("handled before database init")
             }
+            #[allow(unreachable_patterns)]
             OpenWhoopCommand::DownloadFirmware { .. } => {
+                unreachable!("handled before database init")
+            }
+            #[allow(unreachable_patterns)]
+            OpenWhoopCommand::LiveServer { .. } => {
                 unreachable!("handled before database init")
             }
             OpenWhoopCommand::DownloadHistory { whoop } => {

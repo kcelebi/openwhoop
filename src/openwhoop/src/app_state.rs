@@ -4,7 +4,6 @@ use tokio::sync::{broadcast, mpsc};
 
 use openwhoop::{StudioDeviceJob, db::DatabaseHandler};
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct AppState {
     pub db: Option<DatabaseHandler>,
