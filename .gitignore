@@ -1,5 +1,9 @@
 /target
+.venv/
+.pgdata/
 .env
 db.sqlite
 db.sqlite-journal
 /firmware
+web/live-dashboard/node_modules/
+web/live-dashboard/dist/

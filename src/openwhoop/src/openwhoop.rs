@@ -1,11 +1,14 @@
+use std::sync::{Arc, Mutex};
+
 use btleplug::api::ValueNotification;
-use chrono::{DateTime, Local, TimeDelta};
-use openwhoop_entities::packets;
-use openwhoop_db::{DatabaseHandler, SearchHistory};
+use chrono::{DateTime, Local, TimeDelta, Utc};
 use openwhoop_codec::{
     Activity, HistoryReading, WhoopData, WhoopPacket,
-    constants::{CMD_FROM_STRAP, DATA_FROM_STRAP, MetadataType},
+    constants::{CMD_FROM_STRAP, DATA_FROM_STRAP, EVENTS_FROM_STRAP, MEMFAULT, MetadataType},
 };
+use openwhoop_db::{DatabaseHandler, SearchHistory};
+use openwhoop_entities::packets;
+use tokio::sync::broadcast;
 
 use crate::{
     algo::{
@@ -20,6 +23,16 @@ pub struct OpenWhoop {
     pub packet: Option<WhoopPacket>,
     pub last_history_packet: Option<HistoryReading>,
     pub history_packets: Vec<HistoryReading>,
+    /// When set, JSON lines are pushed for the local live dashboard WebSocket.
+    pub live_tx: Option<broadcast::Sender<String>>,
+    /// Latest heart-rate JSON for new WebSocket subscribers (replay on connect).
+    pub live_hr_snapshot: Option<Arc<Mutex<Option<String>>>>,
+    /// After `HistoryComplete`, device loop should send another `history_start` so new samples keep flowing.
+    history_refresh_requested: bool,
+    /// Wall-clock lag probe source: latest history sample unix timestamp (ms).
+    last_sample_unix_ms: Option<u64>,
+    /// Wall-clock lag probe source: when we received that sample (ms).
+    last_sample_received_ms: Option<i64>,
 }
 
 impl OpenWhoop {
@@ -29,7 +42,42 @@ impl OpenWhoop {
             packet: None,
             last_history_packet: None,
             history_packets: Vec::new(),
+            live_tx: None,
+            live_hr_snapshot: None,
+            history_refresh_requested: false,
+            last_sample_unix_ms: None,
+            last_sample_received_ms: None,
         }
+    }
+
+    pub fn take_history_refresh_requested(&mut self) -> bool {
+        std::mem::take(&mut self.history_refresh_requested)
+    }
+
+    pub fn with_live_broadcast(mut self, tx: broadcast::Sender<String>) -> Self {
+        self.live_tx = Some(tx);
+        self
+    }
+
+    pub fn with_live_hr_snapshot(mut self, snap: Arc<Mutex<Option<String>>>) -> Self {
+        self.live_hr_snapshot = Some(snap);
+        self
+    }
+
+    pub fn emit_live_json(&self, payload: serde_json::Value) {
+        if let Some(tx) = self.live_tx.as_ref() {
+            let _ = tx.send(payload.to_string());
+        }
+    }
+
+    pub fn latest_lag_ms(&self, now_ms: i64) -> Option<i64> {
+        self.last_sample_unix_ms
+            .map(|unix| now_ms - i64::try_from(unix).unwrap_or(now_ms))
+            .map(|v| v.max(0))
+    }
+
+    pub fn last_notification_age_ms(&self, now_ms: i64) -> Option<i64> {
+        self.last_sample_received_ms.map(|rx| (now_ms - rx).max(0))
     }
 
     pub async fn store_packet(
@@ -50,7 +98,7 @@ impl OpenWhoop {
     ) -> anyhow::Result<Option<WhoopPacket>> {
         let data = match packet.uuid {
             DATA_FROM_STRAP => {
-                let packet = if let Some(mut whoop_packet) = self.packet.take() {
+                let framed = if let Some(mut whoop_packet) = self.packet.take() {
                     // TODO: maybe not needed but it would be nice to handle packet length here
                     // so if next packet contains end of one and start of another it is handled
 
@@ -71,21 +119,72 @@ impl OpenWhoop {
                     packet
                 };
 
-                let Ok(data) = WhoopData::from_packet(packet) else {
-                    return Ok(None);
-                };
-                data
+                let ptype = framed.packet_type;
+                let pcmd = framed.cmd;
+                let plen = framed.data.len();
+                let head: Vec<u8> = framed.data.iter().take(8).cloned().collect();
+                match WhoopData::from_packet(framed) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        debug!(
+                            "DATA_FROM_STRAP: WhoopData parse skipped (type={:?} cmd=0x{:02x} payload={}B head={:02x?})",
+                            ptype, pcmd, plen, head
+                        );
+                        return Ok(None);
+                    }
+                }
             }
             CMD_FROM_STRAP => {
-                let packet = WhoopPacket::from_data(packet.bytes)?;
-
-                let Ok(data) = WhoopData::from_packet(packet) else {
-                    return Ok(None);
-                };
-
-                data
+                let framed = WhoopPacket::from_data(packet.bytes)?;
+                let ptype = framed.packet_type;
+                let pcmd = framed.cmd;
+                let plen = framed.data.len();
+                let head: Vec<u8> = framed.data.iter().take(8).cloned().collect();
+                match WhoopData::from_packet(framed) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        debug!(
+                            "CMD_FROM_STRAP: WhoopData parse skipped (type={:?} cmd=0x{:02x} payload={}B head={:02x?})",
+                            ptype, pcmd, plen, head
+                        );
+                        return Ok(None);
+                    }
+                }
             }
-            _ => return Ok(None),
+            EVENTS_FROM_STRAP => {
+                let framed = match WhoopPacket::from_data(packet.bytes.clone()) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        trace!(
+                            "EVENTS_FROM_STRAP ({} bytes, not a framed Whoop packet)",
+                            packet.bytes.len()
+                        );
+                        return Ok(None);
+                    }
+                };
+                match WhoopData::from_packet(framed) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        trace!(
+                            "EVENTS_FROM_STRAP ({} bytes, WhoopData parse skipped)",
+                            packet.bytes.len()
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+            MEMFAULT => {
+                trace!("MEMFAULT ({} bytes)", packet.bytes.len());
+                return Ok(None);
+            }
+            _ => {
+                warn!(
+                    "Unhandled GATT characteristic {} ({} bytes)",
+                    packet.uuid,
+                    packet.bytes.len()
+                );
+                return Ok(None);
+            }
         };
 
         self.handle_data(data).await
@@ -94,37 +193,95 @@ impl OpenWhoop {
     async fn handle_data(&mut self, data: WhoopData) -> anyhow::Result<Option<WhoopPacket>> {
         match data {
             WhoopData::HistoryReading(hr) if hr.is_valid() => {
-                if let Some(last_packet) = self.last_history_packet.as_mut() {
-                    if last_packet.unix == hr.unix && last_packet.bpm == hr.bpm {
-                        return Ok(None);
-                    } else {
-                        last_packet.unix = hr.unix;
-                        last_packet.bpm = hr.bpm;
-                    }
-                } else {
-                    self.last_history_packet = Some(hr.clone());
-                }
-
                 let ptime = DateTime::from_timestamp_millis(i64::try_from(hr.unix)?)
                     .unwrap()
                     .with_timezone(&Local)
                     .format("%Y-%m-%d %H:%M:%S");
 
-                if hr.imu_data.is_empty() {
-                    info!(target: "HistoryReading", "time: {}", ptime);
+                // Dashboard WebSocket: emit every valid sample so Pulse can plot catch-up in real time
+                // and the right-hand readout updates as data arrives.
+                if let Some(tx) = self.live_tx.as_ref() {
+                    let received_at_ms = Utc::now().timestamp_millis();
+                    let payload = serde_json::json!({
+                        "type": "heart_rate",
+                        "unix_ms": hr.unix,
+                        "bpm": hr.bpm,
+                        "time_local": format!("{ptime}"),
+                        "rr_count": hr.rr.len(),
+                        "imu_count": hr.imu_data.len(),
+                        "skin_contact": hr.sensor_data.as_ref().map(|s| s.skin_contact),
+                        "signal_quality": hr.sensor_data.as_ref().map(|s| s.signal_quality),
+                        "received_at_ms": received_at_ms,
+                    });
+                    let line = payload.to_string();
+                    if let Some(snap) = self.live_hr_snapshot.as_ref() {
+                        if let Ok(mut g) = snap.lock() {
+                            *g = Some(line.clone());
+                        }
+                    }
+                    let _ = tx.send(line);
+                }
+                self.last_sample_unix_ms = Some(hr.unix);
+                self.last_sample_received_ms = Some(Utc::now().timestamp_millis());
+
+                if let Some(last_packet) = self.last_history_packet.as_mut() {
+                    if last_packet.unix == hr.unix && last_packet.bpm == hr.bpm {
+                        return Ok(None);
+                    }
+                    last_packet.unix = hr.unix;
+                    last_packet.bpm = hr.bpm;
                 } else {
-                    info!(target: "HistoryReading", "time: {}, (IMU)", ptime);
+                    self.last_history_packet = Some(hr.clone());
+                }
+
+                if hr.imu_data.is_empty() {
+                    info!("HistoryReading time: {}", ptime);
+                } else {
+                    info!("HistoryReading time: {} (IMU)", ptime);
                 }
 
                 self.history_packets.push(hr);
             }
+            WhoopData::HistoryReading(hr) => {
+                debug!(
+                    "HistoryReading skipped (validation failed) unix_ms={} bpm={}",
+                    hr.unix, hr.bpm
+                );
+            }
             WhoopData::HistoryMetadata { data, cmd, .. } => match cmd {
-                MetadataType::HistoryComplete => {}
-                MetadataType::HistoryStart => {}
+                MetadataType::HistoryComplete => {
+                    info!("HistoryMetadata: HistoryComplete");
+                    self.history_refresh_requested = true;
+                    if let Some(tx) = self.live_tx.as_ref() {
+                        let _ =
+                            tx.send(serde_json::json!({ "type": "history_complete" }).to_string());
+                    }
+                }
+                MetadataType::HistoryStart => {
+                    info!("HistoryMetadata: HistoryStart (batch)");
+                    if let Some(tx) = self.live_tx.as_ref() {
+                        let _ = tx
+                            .send(serde_json::json!({ "type": "history_batch_start" }).to_string());
+                    }
+                }
                 MetadataType::HistoryEnd => {
-                    self.database
-                        .create_readings(std::mem::take(&mut self.history_packets))
-                        .await?;
+                    let batch = std::mem::take(&mut self.history_packets);
+                    let n = batch.len();
+                    self.database.create_readings(batch).await?;
+                    info!(
+                        "HistoryMetadata: HistoryEnd — committed {} readings to database",
+                        n
+                    );
+
+                    if let Some(tx) = self.live_tx.as_ref() {
+                        let _ = tx.send(
+                            serde_json::json!({
+                                "type": "history_batch_end",
+                                "readings_committed": n,
+                            })
+                            .to_string(),
+                        );
+                    }
 
                     let packet = WhoopPacket::history_end(data);
                     return Ok(Some(packet));
@@ -133,13 +290,89 @@ impl OpenWhoop {
             WhoopData::ConsoleLog { log, .. } => {
                 trace!(target: "ConsoleLog", "{}", log);
             }
-            WhoopData::RunAlarm { .. } => {}
-            WhoopData::AlarmInfo { .. } => {}
-            WhoopData::Event { .. } => {}
+            WhoopData::AlarmInfo { enabled, unix } => {
+                if let Some(tx) = self.live_tx.as_ref() {
+                    let _ = tx.send(
+                        serde_json::json!({
+                            "type": "alarm_state",
+                            "enabled": enabled,
+                            "unix": unix,
+                            "received_at_ms": Utc::now().timestamp_millis(),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
             WhoopData::VersionInfo { harvard, boylston } => {
                 info!("version harvard {} boylston {}", harvard, boylston);
+                if let Some(tx) = self.live_tx.as_ref() {
+                    let _ = tx.send(
+                        serde_json::json!({
+                            "type": "version",
+                            "harvard": harvard,
+                            "boylston": boylston,
+                        })
+                        .to_string(),
+                    );
+                }
             }
-            _ => {}
+            WhoopData::BatteryLevel {
+                percent,
+                raw_tail_hex,
+            } => {
+                if let Some(tx) = self.live_tx.as_ref() {
+                    let _ = tx.send(
+                        serde_json::json!({
+                            "type": "battery_candidate",
+                            "source": "cmd26",
+                            "percent": percent,
+                            "raw_tail_hex": raw_tail_hex,
+                            "received_at_ms": Utc::now().timestamp_millis(),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+            WhoopData::RunAlarm { unix } => {
+                let _ = self.database.mark_alarm_rang(i64::from(unix)).await;
+                if let Some(tx) = self.live_tx.as_ref() {
+                    let _ = tx.send(
+                        serde_json::json!({
+                            "type": "strap_alarm_fired",
+                            "unix": unix,
+                            "received_at_ms": Utc::now().timestamp_millis(),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+            WhoopData::Event { unix, event } => {
+                if let Some(tx) = self.live_tx.as_ref() {
+                    let _ = tx.send(
+                        serde_json::json!({
+                            "type": "device_event",
+                            "unix": unix,
+                            "command": format!("{:?}", event),
+                            "command_code": event.as_u8(),
+                            "received_at_ms": Utc::now().timestamp_millis(),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+            WhoopData::UnknownEvent { unix, event } => {
+                if let Some(tx) = self.live_tx.as_ref() {
+                    let _ = tx.send(
+                        serde_json::json!({
+                            "type": "strap_unknown_event",
+                            "unix": unix,
+                            "event_code": event,
+                            "received_at_ms": Utc::now().timestamp_millis(),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
         }
 
         Ok(None)
@@ -278,8 +511,9 @@ impl OpenWhoop {
         loop {
             let last = self.database.last_spo2_time().await?;
             let options = SearchHistory {
-                from: last
-                    .map(|t| t - TimeDelta::seconds(i64::try_from(SpO2Calculator::WINDOW_SIZE).unwrap_or(0))),
+                from: last.map(|t| {
+                    t - TimeDelta::seconds(i64::try_from(SpO2Calculator::WINDOW_SIZE).unwrap_or(0))
+                }),
                 to: None,
                 limit: Some(86400),
             };
@@ -331,8 +565,11 @@ impl OpenWhoop {
         loop {
             let last_stress = self.database.last_stress_time().await?;
             let options = SearchHistory {
-                from: last_stress
-                    .map(|t| t - TimeDelta::seconds(i64::try_from(StressCalculator::MIN_READING_PERIOD).unwrap_or(0))),
+                from: last_stress.map(|t| {
+                    t - TimeDelta::seconds(
+                        i64::try_from(StressCalculator::MIN_READING_PERIOD).unwrap_or(0),
+                    )
+                }),
                 to: None,
                 limit: Some(86400),
             };

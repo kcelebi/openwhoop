@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use base64::Engine;
@@ -6,6 +7,23 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 const API_BASE: &str = "https://api.prod.whoop.com";
+
+/// Upper bound on base64-decoded firmware payload (mitigates memory pressure from hostile API JSON).
+const MAX_FIRMWARE_ZIP_BYTES: usize = 512 * 1024 * 1024;
+/// Mitigates zip bombs with huge central directories.
+const MAX_ZIP_ENTRIES: usize = 10_000;
+/// Per-entry uncompressed size cap (firmware partitions are far smaller).
+const MAX_UNCOMPRESSED_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+/// Total uncompressed bytes written under `output_dir`.
+const MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .https_only(true)
+        .build()
+        .context("failed to build HTTP client")
+}
 
 #[derive(Serialize)]
 struct SignInRequest<'a> {
@@ -59,7 +77,7 @@ pub struct WhoopApiClient {
 
 impl WhoopApiClient {
     pub async fn sign_in(email: &str, password: &str) -> anyhow::Result<Self> {
-        let client = reqwest::Client::new();
+        let client = http_client()?;
 
         let resp = client
             .post(format!("{API_BASE}/auth-service/v2/whoop/sign-in"))
@@ -96,9 +114,7 @@ impl WhoopApiClient {
     ) -> anyhow::Result<String> {
         let resp = self
             .client
-            .post(format!(
-                "{API_BASE}/firmware-service/v4/firmware/version"
-            ))
+            .post(format!("{API_BASE}/firmware-service/v4/firmware/version"))
             .query(&[("deviceName", device_name)])
             .header("Authorization", format!("Bearer {}", self.token))
             .header("X-WHOOP-Device-Platform", "ANDROID")
@@ -147,6 +163,14 @@ pub fn decode_and_extract(firmware_b64: &str, output_dir: &Path) -> anyhow::Resu
         .decode(firmware_b64)
         .context("failed to base64-decode firmware")?;
 
+    if zip_bytes.len() > MAX_FIRMWARE_ZIP_BYTES {
+        bail!(
+            "decoded firmware is {} bytes (max {}); refusing to process",
+            zip_bytes.len(),
+            MAX_FIRMWARE_ZIP_BYTES
+        );
+    }
+
     log::info!(
         "decoded firmware ZIP: {} bytes ({:.1} KB)",
         zip_bytes.len(),
@@ -158,24 +182,79 @@ pub fn decode_and_extract(firmware_b64: &str, output_dir: &Path) -> anyhow::Resu
         .with_context(|| format!("failed to write {}", zip_path.display()))?;
     log::info!("saved ZIP to {}", zip_path.display());
 
-    let cursor = std::io::Cursor::new(&zip_bytes);
+    let cursor = io::Cursor::new(&zip_bytes);
     let mut archive = zip::ZipArchive::new(cursor).context("invalid ZIP archive")?;
 
+    let n_entries = archive.len();
+    if n_entries > MAX_ZIP_ENTRIES {
+        bail!(
+            "zip has {} entries (max {}); refusing to extract",
+            n_entries,
+            MAX_ZIP_ENTRIES
+        );
+    }
+
+    let root = std::fs::canonicalize(output_dir)
+        .with_context(|| format!("failed to canonicalize {}", output_dir.display()))?;
+
+    let mut total_uncompressed: u64 = 0;
+
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let name = file.name().to_string();
-        let out_path = output_dir.join(&name);
+        let file = archive.by_index(i)?;
+
+        if file.encrypted() {
+            bail!("zip entry {:?} is encrypted; refusing", file.name());
+        }
+        if file.is_symlink() {
+            bail!("zip entry {:?} is a symlink; refusing", file.name());
+        }
+
+        let rel: PathBuf = match file.enclosed_name() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => bail!("zip entry {:?} has unsafe or empty path", file.name()),
+        };
+
+        let out_path = root.join(&rel);
+        if !out_path.starts_with(&root) {
+            bail!(
+                "zip entry {:?} resolves outside output directory",
+                file.name()
+            );
+        }
 
         if file.is_dir() {
             std::fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut out_file = std::fs::File::create(&out_path)?;
-            std::io::copy(&mut file, &mut out_file)?;
-            log::info!("  {} ({} bytes)", name, file.size());
+            continue;
         }
+
+        if file.size() > MAX_UNCOMPRESSED_ENTRY_BYTES {
+            bail!(
+                "zip entry {:?} claims {} bytes uncompressed (max {})",
+                file.name(),
+                file.size(),
+                MAX_UNCOMPRESSED_ENTRY_BYTES
+            );
+        }
+
+        let Some(parent) = out_path.parent() else {
+            bail!("zip entry {:?} has no parent path", file.name());
+        };
+        std::fs::create_dir_all(parent)?;
+
+        let mut out_file = std::fs::File::create(&out_path)?;
+        let limit = file.size().min(MAX_UNCOMPRESSED_ENTRY_BYTES);
+        let written = io::copy(&mut file.take(limit), &mut out_file)?;
+        total_uncompressed = total_uncompressed
+            .checked_add(written)
+            .context("total uncompressed size overflow")?;
+        if total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
+            bail!(
+                "extracted more than {} bytes total; possible zip bomb",
+                MAX_TOTAL_UNCOMPRESSED_BYTES
+            );
+        }
+
+        log::info!("  {} ({} bytes)", rel.display(), written);
     }
 
     log::info!("firmware files saved to {}/", output_dir.display());

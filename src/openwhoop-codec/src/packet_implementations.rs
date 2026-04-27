@@ -54,7 +54,8 @@ impl WhoopPacket {
 
     pub fn set_time() -> Result<WhoopPacket, WhoopError> {
         let mut data = vec![];
-        let current_time = u32::try_from(Utc::now().timestamp()).map_err(|_| WhoopError::Overflow)?;
+        let current_time =
+            u32::try_from(Utc::now().timestamp()).map_err(|_| WhoopError::Overflow)?;
         data.extend_from_slice(&current_time.to_le_bytes());
         data.append(&mut vec![0, 0, 0, 0, 0]); // padding
         Ok(WhoopPacket::new(
@@ -153,6 +154,24 @@ impl WhoopPacket {
         )
     }
 
+    pub fn get_battery_level() -> WhoopPacket {
+        WhoopPacket::new(
+            PacketType::Command,
+            0,
+            CommandNumber::GetBatteryLevel.as_u8(),
+            vec![0x00],
+        )
+    }
+
+    pub fn disable_alarm() -> WhoopPacket {
+        WhoopPacket::new(
+            PacketType::Command,
+            0,
+            CommandNumber::DisableAlarm.as_u8(),
+            vec![0x00],
+        )
+    }
+
     pub fn enable_optical_data(enable: bool) -> WhoopPacket {
         WhoopPacket::new(
             PacketType::Command,
@@ -168,6 +187,24 @@ impl WhoopPacket {
             0,
             CommandNumber::ToggleOpticalMode.as_u8(),
             vec![0x01, u8::from(enable)],
+        )
+    }
+
+    pub fn buzzer() -> WhoopPacket {
+        WhoopPacket::new(
+            PacketType::Command,
+            0,
+            CommandNumber::RunHapticsPattern.as_u8(),
+            vec![0x01, 0x01, 0x01, 0x00, 0x00],
+        )
+    }
+
+    pub fn stop_buzzer() -> WhoopPacket {
+        WhoopPacket::new(
+            PacketType::Command,
+            0,
+            CommandNumber::StopHaptics.as_u8(),
+            vec![],
         )
     }
 }
@@ -250,7 +287,10 @@ mod tests {
     fn erase_packet() {
         let p = WhoopPacket::erase();
         assert_command_packet(&p, CommandNumber::ForceTrim);
-        assert_eq!(p.data, vec![0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0x00]);
+        assert_eq!(
+            p.data,
+            vec![0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0x00]
+        );
         assert_roundtrip(&p);
     }
 

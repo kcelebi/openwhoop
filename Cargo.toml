@@ -36,6 +36,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sea-orm-migration = { version = "1.1.0", features = ["runtime-tokio-rustls", "sqlx-sqlite", "sqlx-postgres"] }
 strum = "0.26.3"
 zip = "2"
+axum = { version = "0.8.8", features = ["json", "ws"] }
+tower-http = { version = "0.6.2", features = ["cors"] }
+cron = "0.12.1"
 
 openwhoop-algos = { path = "src/openwhoop-algos" }
 openwhoop-codec = { path = "src/openwhoop-codec" }

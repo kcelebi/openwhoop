@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+cron.workspace = true
 indicatif.workspace = true
 openwhoop-algos.workspace = true
 openwhoop-codec.workspace = true

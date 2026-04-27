@@ -25,18 +25,18 @@ use btleplug::{
 use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, TimeDelta, Utc};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use openwhoop_entities::packets;
 use dotenv::dotenv;
+use openwhoop::api;
 use openwhoop::{
     OpenWhoop, StudioDeviceJob, WhoopDevice,
     algo::{ExerciseMetrics, SleepConsistencyAnalyzer},
     db::DatabaseHandler,
     types::activities::{ActivityType, SearchActivityPeriods},
 };
+use openwhoop_codec::{WhoopPacket, constants::WHOOP_SERVICE};
+use openwhoop_entities::packets;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, timeout};
-use openwhoop::api;
-use openwhoop_codec::{WhoopPacket, constants::WHOOP_SERVICE};
 
 use crate::app_state::AppState;
 
@@ -313,9 +313,7 @@ async fn download_firmware(
     };
 
     let target_versions: std::collections::HashMap<&str, &str> =
-        [("MAXIM", maxim), ("NORDIC", nordic)]
-            .into_iter()
-            .collect();
+        [("MAXIM", maxim), ("NORDIC", nordic)].into_iter().collect();
 
     let current: Vec<api::ChipFirmware> = chip_names
         .iter()
@@ -523,7 +521,8 @@ impl OpenWhoopCli {
             output_dir,
         } = &self.subcommand
         {
-            return download_firmware(email, password, device_name, maxim, nordic, output_dir).await;
+            return download_firmware(email, password, device_name, maxim, nordic, output_dir)
+                .await;
         }
 
         match &self.subcommand {
@@ -640,15 +639,13 @@ impl OpenWhoopCli {
                             "state_seq": session_seq,
                             "scan_cycle": scan_cycle,
                             "received_at_ms": Utc::now().timestamp_millis(),
-                        }).to_string(),
+                        })
+                        .to_string(),
                     );
 
-                    let Some(peripheral) = scan_command_with_timeout(
-                        &adapter,
-                        whoop.clone(),
-                        Duration::from_secs(60),
-                    )
-                    .await?
+                    let Some(peripheral) =
+                        scan_command_with_timeout(&adapter, whoop.clone(), Duration::from_secs(60))
+                            .await?
                     else {
                         session_seq = session_seq.saturating_add(1);
                         let _ = live_tx.send(
@@ -659,7 +656,8 @@ impl OpenWhoopCli {
                                 "state_seq": session_seq,
                                 "scan_cycle": scan_cycle,
                                 "received_at_ms": Utc::now().timestamp_millis(),
-                            }).to_string(),
+                            })
+                            .to_string(),
                         );
                         sleep(Duration::from_secs(60)).await;
                         continue;
@@ -730,7 +728,9 @@ impl OpenWhoopCli {
                     session_seq = tracker.state_seq;
 
                     if let Ok(true) = device.is_connected().await {
-                        let _ = device.send_command(WhoopPacket::exit_high_freq_sync()).await;
+                        let _ = device
+                            .send_command(WhoopPacket::exit_high_freq_sync())
+                            .await;
                     }
 
                     if should_exit.load(Ordering::SeqCst) {
@@ -944,10 +944,15 @@ impl OpenWhoopCli {
             OpenWhoopCommand::DownloadFirmware { .. } => {
                 unreachable!("handled before BLE/DB init")
             }
-            OpenWhoopCommand::Scheduler { interval_secs, device_id, studio_url } => {
-                let db_url = self.database_url.as_deref().ok_or_else(|| {
-                    anyhow!("DATABASE_URL is required for scheduler")
-                })?;
+            OpenWhoopCommand::Scheduler {
+                interval_secs,
+                device_id,
+                studio_url,
+            } => {
+                let db_url = self
+                    .database_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("DATABASE_URL is required for scheduler"))?;
                 let db = DatabaseHandler::new(db_url).await;
                 Self::run_scheduler(interval_secs, &device_id, &studio_url, db).await?;
                 return Ok(());
@@ -974,30 +979,41 @@ impl OpenWhoopCli {
                 info!("Connected to live-server at {}", studio_url);
             }
             Ok(resp) => {
-                anyhow::bail!("live-server at {} returned HTTP {}", studio_url, resp.status());
+                anyhow::bail!(
+                    "live-server at {} returned HTTP {}",
+                    studio_url,
+                    resp.status()
+                );
             }
             Err(e) => {
-                anyhow::bail!("Cannot reach live-server at {}: {}. Is it running with OPENWHOOP_STUDIO_BIND=0.0.0.0?", studio_url, e);
+                anyhow::bail!(
+                    "Cannot reach live-server at {}: {}. Is it running with OPENWHOOP_STUDIO_BIND=0.0.0.0?",
+                    studio_url,
+                    e
+                );
             }
         };
 
         match command {
             AgentCommand::Buzzer => {
-                let resp = client.post(format!("{}/api/device/buzzer", studio_url))
+                let resp = client
+                    .post(format!("{}/api/device/buzzer", studio_url))
                     .send()
                     .await?;
                 let json: serde_json::Value = resp.json().await?;
                 println!("{}", serde_json::to_string_pretty(&json)?);
             }
             AgentCommand::Battery => {
-                let resp = client.post(format!("{}/api/device/battery", studio_url))
+                let resp = client
+                    .post(format!("{}/api/device/battery", studio_url))
                     .send()
                     .await?;
                 let json: serde_json::Value = resp.json().await?;
                 println!("{}", serde_json::to_string_pretty(&json)?);
             }
             AgentCommand::GetAlarm => {
-                let resp = client.get(format!("{}/api/device/alarm", studio_url))
+                let resp = client
+                    .get(format!("{}/api/device/alarm", studio_url))
                     .send()
                     .await?;
                 let json: serde_json::Value = resp.json().await?;
@@ -1010,7 +1026,8 @@ impl OpenWhoopCli {
                     anyhow::bail!("Time {} is in past", time.format("%Y-%m-%d %H:%M:%S"));
                 }
                 let unix = u32::try_from(time.timestamp())?;
-                let resp = client.post(format!("{}/api/device/alarm", studio_url))
+                let resp = client
+                    .post(format!("{}/api/device/alarm", studio_url))
                     .json(&serde_json::json!({ "unix": unix }))
                     .send()
                     .await?;
@@ -1018,20 +1035,26 @@ impl OpenWhoopCli {
                 println!("{}", serde_json::to_string_pretty(&json)?);
             }
             AgentCommand::ClearAlarm => {
-                let resp = client.post(format!("{}/api/device/alarm/clear", studio_url))
+                let resp = client
+                    .post(format!("{}/api/device/alarm/clear", studio_url))
                     .send()
                     .await?;
                 let json: serde_json::Value = resp.json().await?;
                 println!("{}", serde_json::to_string_pretty(&json)?);
             }
             AgentCommand::ListAlarms => {
-                let resp = client.get(format!("{}/api/alarms", studio_url))
+                let resp = client
+                    .get(format!("{}/api/alarms", studio_url))
                     .send()
                     .await?;
                 let json: serde_json::Value = resp.json().await?;
                 println!("{}", serde_json::to_string_pretty(&json)?);
             }
-            AgentCommand::CreateAlarm { label, kind, schedule } => {
+            AgentCommand::CreateAlarm {
+                label,
+                kind,
+                schedule,
+            } => {
                 let (cron_expr, one_time_unix) = match kind.as_str() {
                     "cron" => (Some(schedule.clone()), None),
                     "one-time" => {
@@ -1040,7 +1063,8 @@ impl OpenWhoopCli {
                     }
                     _ => anyhow::bail!("kind must be 'cron' or 'one-time'"),
                 };
-                let resp = client.post(format!("{}/api/alarms", studio_url))
+                let resp = client
+                    .post(format!("{}/api/alarms", studio_url))
                     .json(&serde_json::json!({
                         "label": label,
                         "kind": kind,
@@ -1053,7 +1077,8 @@ impl OpenWhoopCli {
                 println!("{}", serde_json::to_string_pretty(&json)?);
             }
             AgentCommand::DeleteAlarm { id } => {
-                let resp = client.delete(format!("{}/api/alarms/{}", studio_url, id))
+                let resp = client
+                    .delete(format!("{}/api/alarms/{}", studio_url, id))
                     .send()
                     .await?;
                 let json: serde_json::Value = resp.json().await?;
@@ -1070,30 +1095,34 @@ impl OpenWhoopCli {
         let db = DatabaseHandler::new(database_url.to_owned()).await;
 
         match command {
-            QueueCommand::List { device_id } => {
-                match device_id {
-                    Some(id) => {
-                        let pending = db.list_pending_commands(&id).await?;
-                        println!("Pending commands for device '{}':", id);
-                        for cmd in pending {
-                            println!("  [{}] {} - {:?}", cmd.id, cmd.command_type, cmd.payload);
-                        }
-                    }
-                    None => {
-                        println!("Listing all pending commands requires device_id for now");
+            QueueCommand::List { device_id } => match device_id {
+                Some(id) => {
+                    let pending = db.list_pending_commands(&id).await?;
+                    println!("Pending commands for device '{}':", id);
+                    for cmd in pending {
+                        println!("  [{}] {} - {:?}", cmd.id, cmd.command_type, cmd.payload);
                     }
                 }
-            }
-            QueueCommand::Push { device_id, command, payload } => {
-                let payload_json: Option<serde_json::Value> = payload
-                    .as_ref()
-                    .and_then(|p| serde_json::from_str(p).ok());
+                None => {
+                    println!("Listing all pending commands requires device_id for now");
+                }
+            },
+            QueueCommand::Push {
+                device_id,
+                command,
+                payload,
+            } => {
+                let payload_json: Option<serde_json::Value> =
+                    payload.as_ref().and_then(|p| serde_json::from_str(p).ok());
                 let id = db.push_command(&device_id, &command, payload_json).await?;
                 println!("Queued command {} (id={})", command, id);
             }
-            QueueCommand::Process { device_id, studio_url } => {
+            QueueCommand::Process {
+                device_id,
+                studio_url,
+            } => {
                 let url = studio_url.unwrap_or_else(|| "http://127.0.0.1:3848".to_string());
-                
+
                 // Connection check before processing queue
                 let client = reqwest::Client::new();
                 match client.get(format!("{}/health", url)).send().await {
@@ -1101,41 +1130,62 @@ impl OpenWhoopCli {
                         info!("Connected to live-server at {}", url);
                     }
                     Ok(resp) => {
-                        println!("Warning: live-server at {} returned HTTP {}", url, resp.status());
+                        println!(
+                            "Warning: live-server at {} returned HTTP {}",
+                            url,
+                            resp.status()
+                        );
                     }
                     Err(e) => {
                         println!("Warning: Cannot reach live-server at {}: {}", url, e);
                         println!("Commands will remain queued until connection is restored.");
                     }
                 }
-                
+
                 let pending = db.list_pending_commands(&device_id).await?;
-                
+
                 if pending.is_empty() {
                     println!("No pending commands for device '{}'", device_id);
                     return Ok(());
                 }
 
-                println!("Processing {} pending commands for device '{}'...", pending.len(), device_id);
-                
+                println!(
+                    "Processing {} pending commands for device '{}'...",
+                    pending.len(),
+                    device_id
+                );
+
                 for cmd in pending {
                     let result = match cmd.command_type.as_str() {
-                        "buzzer" => client.post(format!("{}/api/device/buzzer", url)).send().await,
+                        "buzzer" => {
+                            client
+                                .post(format!("{}/api/device/buzzer", url))
+                                .send()
+                                .await
+                        }
                         "set-alarm" => {
                             let payload = cmd.payload.as_ref();
                             let unix = payload.and_then(|p| p.get("unix")).and_then(|v| v.as_u64());
                             match unix {
-                                Some(u) => client.post(format!("{}/api/device/alarm", url))
-                                    .json(&serde_json::json!({ "unix": u32::try_from(u)? }))
-                                    .send()
-                                    .await,
+                                Some(u) => {
+                                    client
+                                        .post(format!("{}/api/device/alarm", url))
+                                        .json(&serde_json::json!({ "unix": u32::try_from(u)? }))
+                                        .send()
+                                        .await
+                                }
                                 None => {
                                     println!("Skipping set-alarm: missing unix in payload");
                                     continue;
                                 }
                             }
                         }
-                        "clear-alarm" => client.post(format!("{}/api/device/alarm/clear", url)).send().await,
+                        "clear-alarm" => {
+                            client
+                                .post(format!("{}/api/device/alarm/clear", url))
+                                .send()
+                                .await
+                        }
                         _ => {
                             println!("Unknown command type: {}", cmd.command_type);
                             continue;
@@ -1160,30 +1210,46 @@ impl OpenWhoopCli {
                 }
             }
             QueueCommand::ClearFailed { device_id } => {
-                println!("Clearing failed commands for device '{}' (not implemented yet)", device_id);
+                println!(
+                    "Clearing failed commands for device '{}' (not implemented yet)",
+                    device_id
+                );
             }
         }
         Ok(())
     }
 
-    async fn run_scheduler(interval_secs: u64, device_id: &str, studio_url: &str, db_handler: DatabaseHandler) -> anyhow::Result<()> {
-        info!("Starting scheduler (interval: {}s, device: {}, studio: {})", interval_secs, device_id, studio_url);
-        
+    async fn run_scheduler(
+        interval_secs: u64,
+        device_id: &str,
+        studio_url: &str,
+        db_handler: DatabaseHandler,
+    ) -> anyhow::Result<()> {
+        info!(
+            "Starting scheduler (interval: {}s, device: {}, studio: {})",
+            interval_secs, device_id, studio_url
+        );
+
         let client = reqwest::Client::new();
-        
+
         loop {
             let now_unix = Utc::now().timestamp();
-            
+
             // Check for due alarms in the database
             let due_alarms = db_handler.advance_due_alarm_schedules(now_unix).await?;
-            
+
             for (schedule_id, next_unix) in due_alarms {
                 // Queue the alarm command
                 let payload = serde_json::json!({ "unix": next_unix, "schedule_id": schedule_id });
-                let _ = db_handler.push_command(device_id, "set-alarm", Some(payload)).await;
-                info!("Queued alarm for schedule {} at unix {}", schedule_id, next_unix);
+                let _ = db_handler
+                    .push_command(device_id, "set-alarm", Some(payload))
+                    .await;
+                info!(
+                    "Queued alarm for schedule {} at unix {}",
+                    schedule_id, next_unix
+                );
             }
-            
+
             // Try to process pending queue (send to live-server)
             let pending = db_handler.list_pending_commands(device_id).await?;
             if !pending.is_empty() {
@@ -1192,7 +1258,8 @@ impl OpenWhoopCli {
                         "set-alarm" => {
                             if let Some(payload) = &cmd.payload {
                                 if let Some(unix) = payload.get("unix").and_then(|v| v.as_u64()) {
-                                    client.post(format!("{}/api/device/alarm", studio_url))
+                                    client
+                                        .post(format!("{}/api/device/alarm", studio_url))
                                         .json(&serde_json::json!({ "unix": u32::try_from(unix)? }))
                                         .send()
                                         .await
@@ -1203,11 +1270,21 @@ impl OpenWhoopCli {
                                 continue;
                             }
                         }
-                        "buzzer" => client.post(format!("{}/api/device/buzzer", studio_url)).send().await,
-                        "clear-alarm" => client.post(format!("{}/api/device/alarm/clear", studio_url)).send().await,
+                        "buzzer" => {
+                            client
+                                .post(format!("{}/api/device/buzzer", studio_url))
+                                .send()
+                                .await
+                        }
+                        "clear-alarm" => {
+                            client
+                                .post(format!("{}/api/device/alarm/clear", studio_url))
+                                .send()
+                                .await
+                        }
                         _ => continue,
                     };
-                    
+
                     match result {
                         Ok(resp) if resp.status().is_success() => {
                             db_handler.mark_command_sent(cmd.id).await?;
@@ -1219,13 +1296,15 @@ impl OpenWhoopCli {
                             warn!("Failed to send command {}: {}", cmd.command_type, err);
                         }
                         Err(e) => {
-                            db_handler.mark_command_failed(cmd.id, &e.to_string()).await?;
+                            db_handler
+                                .mark_command_failed(cmd.id, &e.to_string())
+                                .await?;
                             warn!("Error sending command {}: {}", cmd.command_type, e);
                         }
                     }
                 }
             }
-            
+
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         }
     }

@@ -272,7 +272,10 @@ impl DatabaseHandler {
         id: i32,
         patch: AlarmSchedulePatch,
     ) -> anyhow::Result<Option<alarm_schedules::Model>> {
-        let Some(mut row) = alarm_schedules::Entity::find_by_id(id).one(&self.db).await? else {
+        let Some(mut row) = alarm_schedules::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+        else {
             return Ok(None);
         };
         if let Some(label) = patch.label {
@@ -288,13 +291,18 @@ impl DatabaseHandler {
     }
 
     pub async fn delete_alarm_schedule(&self, id: i32) -> anyhow::Result<bool> {
-        let res = alarm_schedules::Entity::delete_by_id(id).exec(&self.db).await?;
+        let res = alarm_schedules::Entity::delete_by_id(id)
+            .exec(&self.db)
+            .await?;
         Ok(res.rows_affected > 0)
     }
 
     /// Mark all due schedules as rang and compute each schedule's next trigger.
     /// Returns the IDs and next_unix values of schedules that were triggered.
-    pub async fn advance_due_alarm_schedules(&self, now_unix: i64) -> anyhow::Result<Vec<(i32, i64)>> {
+    pub async fn advance_due_alarm_schedules(
+        &self,
+        now_unix: i64,
+    ) -> anyhow::Result<Vec<(i32, i64)>> {
         let due = alarm_schedules::Entity::find()
             .filter(alarm_schedules::Column::Enabled.eq(true))
             .filter(alarm_schedules::Column::NextUnix.lte(now_unix))
@@ -306,7 +314,7 @@ impl DatabaseHandler {
         for mut s in due {
             let next_unix = s.next_unix;
             triggered.push((s.id, next_unix.unwrap_or(now_unix)));
-            
+
             s.last_rang_unix = Some(now_unix);
             s.next_unix = match s.kind.as_str() {
                 "once" => {
@@ -389,7 +397,10 @@ impl DatabaseHandler {
         Ok(())
     }
 
-    pub async fn list_pending_commands(&self, device_id: &str) -> anyhow::Result<Vec<command_queue::Model>> {
+    pub async fn list_pending_commands(
+        &self,
+        device_id: &str,
+    ) -> anyhow::Result<Vec<command_queue::Model>> {
         use command_queue::Entity;
         use sea_orm::QueryFilter;
         Ok(Entity::find()
@@ -427,8 +438,6 @@ impl DatabaseHandler {
     }
 
     pub async fn mark_command_sent(&self, id: i32) -> anyhow::Result<()> {
-        
-        
         use sea_orm::ActiveValue::Set;
 
         let now = Utc::now().naive_utc();
@@ -444,8 +453,6 @@ impl DatabaseHandler {
     }
 
     pub async fn mark_command_failed(&self, id: i32, error: &str) -> anyhow::Result<()> {
-        
-        
         use sea_orm::ActiveValue::Set;
 
         let mut model: command_queue::ActiveModel = command_queue::Entity::find_by_id(id)
@@ -461,7 +468,10 @@ impl DatabaseHandler {
         Ok(())
     }
 
-    pub async fn get_device_alarm_state(&self, device_id: &str) -> anyhow::Result<Option<(bool, i64)>> {
+    pub async fn get_device_alarm_state(
+        &self,
+        device_id: &str,
+    ) -> anyhow::Result<Option<(bool, i64)>> {
         // Get the most recently programmed alarm for this device (from alarm_schedules)
         // In a multi-device scenario, we'd need a device_id column on alarm_schedules too
         // For now, we track device-specific alarm state via a simple query
@@ -664,7 +674,9 @@ mod tests {
         let db = DatabaseHandler::new("sqlite::memory:").await;
 
         let id = db.push_command("device123", "buzzer", None).await.unwrap();
-        db.mark_command_failed(id, "connection timeout").await.unwrap();
+        db.mark_command_failed(id, "connection timeout")
+            .await
+            .unwrap();
 
         let pending = db.list_pending_commands("device123").await.unwrap();
         assert_eq!(pending.len(), 0);
@@ -676,7 +688,13 @@ mod tests {
 
         db.push_command("device1", "buzzer", None).await.unwrap();
         db.push_command("device2", "buzzer", None).await.unwrap();
-        db.push_command("device1", "set-alarm", Some(serde_json::json!({"unix": 1234567890}))).await.unwrap();
+        db.push_command(
+            "device1",
+            "set-alarm",
+            Some(serde_json::json!({"unix": 1234567890})),
+        )
+        .await
+        .unwrap();
 
         let pending1 = db.list_pending_commands("device1").await.unwrap();
         let pending2 = db.list_pending_commands("device2").await.unwrap();

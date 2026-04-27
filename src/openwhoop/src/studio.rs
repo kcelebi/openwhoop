@@ -30,17 +30,29 @@ pub fn api_routes() -> Router<AppState> {
         .route("/api/insights/sleep", get(insights_sleep))
         .route("/api/insights/exercise", get(insights_exercise))
         .route("/api/insights/vitals", get(insights_vitals))
-        .route("/api/insights/heart-rate-series", get(insights_heart_rate_series))
+        .route(
+            "/api/insights/heart-rate-series",
+            get(insights_heart_rate_series),
+        )
         .route("/api/compute/stress", post(compute_stress))
         .route("/api/compute/spo2", post(compute_spo2))
         .route("/api/compute/skin-temp", post(compute_skin_temp))
         .route("/api/compute/detect-events", post(compute_detect_events))
         .route("/api/device/battery", post(device_battery))
-        .route("/api/device/alarm", get(device_alarm_get).post(device_alarm_set))
+        .route(
+            "/api/device/alarm",
+            get(device_alarm_get).post(device_alarm_set),
+        )
         .route("/api/device/alarm/clear", post(device_alarm_clear))
-        .route("/api/device/buzzer", post(device_buzzer).delete(device_buzzer_stop))
+        .route(
+            "/api/device/buzzer",
+            post(device_buzzer).delete(device_buzzer_stop),
+        )
         .route("/api/alarms", get(alarms_list).post(alarms_create))
-        .route("/api/alarms/{id}", patch(alarms_patch).delete(alarms_delete))
+        .route(
+            "/api/alarms/{id}",
+            patch(alarms_patch).delete(alarms_delete),
+        )
         .route("/api/device/imu/r7-toggle", post(device_imu_r7))
         .route("/api/device/imu/mode", post(device_imu_mode))
 }
@@ -56,7 +68,9 @@ async fn insights_sleep(State(app): State<AppState>) -> Result<Json<Value>, (Sta
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if sleep_records.is_empty() {
-        return Ok(Json(json!({ "empty": true, "message": "No sleep data in your history yet." })));
+        return Ok(Json(
+            json!({ "empty": true, "message": "No sleep data in your history yet." }),
+        ));
     }
 
     let mut last_week: Vec<_> = sleep_records.iter().rev().take(7).copied().collect();
@@ -76,20 +90,22 @@ async fn insights_sleep(State(app): State<AppState>) -> Result<Json<Value>, (Sta
     })))
 }
 
-async fn insights_exercise(State(app): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn insights_exercise(
+    State(app): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let db = app.db.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available - run with DATABASE_URL or connect to AWS".into(),
     ))?;
     let exercises = db
-        .search_activities(
-            SearchActivityPeriods::default().with_activity(ActivityType::Activity),
-        )
+        .search_activities(SearchActivityPeriods::default().with_activity(ActivityType::Activity))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if exercises.is_empty() {
-        return Ok(Json(json!({ "empty": true, "message": "No workouts or activities recorded yet." })));
+        return Ok(Json(
+            json!({ "empty": true, "message": "No workouts or activities recorded yet." }),
+        ));
     }
 
     let last_week: Vec<_> = exercises.iter().rev().take(7).copied().rev().collect();
@@ -205,7 +221,9 @@ async fn compute_stress(State(app): State<AppState>) -> Result<Json<Value>, (Sta
     w.calculate_stress()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(json!({ "ok": true, "message": "stress pass complete (see /api/insights/vitals)" })))
+    Ok(Json(
+        json!({ "ok": true, "message": "stress pass complete (see /api/insights/vitals)" }),
+    ))
 }
 
 async fn compute_spo2(State(app): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
@@ -220,7 +238,9 @@ async fn compute_spo2(State(app): State<AppState>) -> Result<Json<Value>, (Statu
     Ok(Json(json!({ "ok": true, "message": "SpO2 pass complete" })))
 }
 
-async fn compute_skin_temp(State(app): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn compute_skin_temp(
+    State(app): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let db = app.db.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available - run with DATABASE_URL or connect to AWS".into(),
@@ -229,10 +249,14 @@ async fn compute_skin_temp(State(app): State<AppState>) -> Result<Json<Value>, (
     w.calculate_skin_temp()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(json!({ "ok": true, "message": "skin temperature pass complete" })))
+    Ok(Json(
+        json!({ "ok": true, "message": "skin temperature pass complete" }),
+    ))
 }
 
-async fn compute_detect_events(State(app): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn compute_detect_events(
+    State(app): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let db = app.db.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available - run with DATABASE_URL or connect to AWS".into(),
@@ -244,7 +268,9 @@ async fn compute_detect_events(State(app): State<AppState>) -> Result<Json<Value
     w.detect_events()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(json!({ "ok": true, "message": "detect-sleeps + detect-events finished" })))
+    Ok(Json(
+        json!({ "ok": true, "message": "detect-sleeps + detect-events finished" }),
+    ))
 }
 
 async fn device_battery(State(app): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
@@ -252,7 +278,12 @@ async fn device_battery(State(app): State<AppState>) -> Result<Json<Value>, (Sta
     app.job_tx
         .send(StudioDeviceJob::PollBattery { reply: tx })
         .await
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "BLE loop not running".into()))?;
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BLE loop not running".into(),
+            )
+        })?;
     let v = timeout(Duration::from_secs(12), rx)
         .await
         .map_err(|_| {
@@ -266,12 +297,19 @@ async fn device_battery(State(app): State<AppState>) -> Result<Json<Value>, (Sta
     Ok(Json(v))
 }
 
-async fn device_alarm_get(State(app): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn device_alarm_get(
+    State(app): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
     app.job_tx
         .send(StudioDeviceJob::GetAlarm { reply: tx })
         .await
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "BLE loop not running".into()))?;
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BLE loop not running".into(),
+            )
+        })?;
     let v = timeout(Duration::from_secs(12), rx)
         .await
         .map_err(|_| {
@@ -302,7 +340,12 @@ async fn device_alarm_set(
             reply: tx,
         })
         .await
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "BLE loop not running".into()))?;
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BLE loop not running".into(),
+            )
+        })?;
     let v = rx
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "reply dropped".into()))?
@@ -310,12 +353,19 @@ async fn device_alarm_set(
     Ok(Json(v))
 }
 
-async fn device_alarm_clear(State(app): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn device_alarm_clear(
+    State(app): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
     app.job_tx
         .send(StudioDeviceJob::ClearAlarm { reply: tx })
         .await
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "BLE loop not running".into()))?;
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BLE loop not running".into(),
+            )
+        })?;
     let v = rx
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "reply dropped".into()))?
@@ -328,7 +378,12 @@ async fn device_buzzer(State(app): State<AppState>) -> Result<Json<Value>, (Stat
     app.job_tx
         .send(StudioDeviceJob::Buzzer { reply: tx })
         .await
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "BLE loop not running".into()))?;
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BLE loop not running".into(),
+            )
+        })?;
     let v = timeout(Duration::from_secs(12), rx)
         .await
         .map_err(|_| {
@@ -342,12 +397,19 @@ async fn device_buzzer(State(app): State<AppState>) -> Result<Json<Value>, (Stat
     Ok(Json(v))
 }
 
-async fn device_buzzer_stop(State(app): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn device_buzzer_stop(
+    State(app): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
     app.job_tx
         .send(StudioDeviceJob::StopBuzzer { reply: tx })
         .await
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "BLE loop not running".into()))?;
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BLE loop not running".into(),
+            )
+        })?;
     let v = timeout(Duration::from_secs(12), rx)
         .await
         .map_err(|_| {
@@ -481,7 +543,12 @@ async fn device_imu_r7(State(app): State<AppState>) -> Result<Json<Value>, (Stat
     app.job_tx
         .send(StudioDeviceJob::ToggleImuCollection { reply: tx })
         .await
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "BLE loop not running".into()))?;
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BLE loop not running".into(),
+            )
+        })?;
     let v = rx
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "reply dropped".into()))?
@@ -508,7 +575,12 @@ async fn device_imu_mode(
             reply: tx,
         })
         .await
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "BLE loop not running".into()))?;
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BLE loop not running".into(),
+            )
+        })?;
     let v = rx
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "reply dropped".into()))?

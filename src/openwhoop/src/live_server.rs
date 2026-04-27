@@ -22,10 +22,7 @@ async fn handle_client(
     ws_tx: broadcast::Sender<String>,
     last_hr_json: Arc<Mutex<Option<String>>>,
 ) {
-    let snapshot = last_hr_json
-        .lock()
-        .ok()
-        .and_then(|g| g.clone());
+    let snapshot = last_hr_json.lock().ok().and_then(|g| g.clone());
     if let Some(snapshot) = snapshot {
         let _ = socket.send(Message::Text(snapshot.into())).await;
     }
@@ -73,12 +70,7 @@ fn cors_layer_from_env() -> Option<CorsLayer> {
     Some(
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::DELETE,
-                Method::OPTIONS,
-            ])
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
             .allow_headers(Any),
     )
 }
@@ -87,7 +79,6 @@ fn cors_layer_from_env() -> Option<CorsLayer> {
 /// Serves device control API endpoints and optional WebSocket for live HR streaming.
 /// All scheduling logic moved to the AWS/scheduler side.
 pub async fn run(app: AppState, port: u16) -> anyhow::Result<()> {
-
     let mut router = Router::new()
         .merge(studio::api_routes())
         .route("/ws", get(ws_handler))

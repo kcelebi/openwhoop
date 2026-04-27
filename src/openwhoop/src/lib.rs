@@ -6,7 +6,10 @@ pub mod db {
 }
 
 mod device;
-pub use device::WhoopDevice;
+pub use device::{SessionState, SessionTracker, WhoopDevice};
+
+pub mod studio_protocol;
+pub use studio_protocol::StudioDeviceJob;
 
 mod openwhoop;
 pub use openwhoop::OpenWhoop;

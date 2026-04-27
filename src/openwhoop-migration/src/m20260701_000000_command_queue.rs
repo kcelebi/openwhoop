@@ -18,8 +18,16 @@ impl MigrationTrait for Migration {
                             .auto_increment()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(CommandQueue::DeviceId).string_len(50).not_null())
-                    .col(ColumnDef::new(CommandQueue::CommandType).string_len(32).not_null())
+                    .col(
+                        ColumnDef::new(CommandQueue::DeviceId)
+                            .string_len(50)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(CommandQueue::CommandType)
+                            .string_len(32)
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(CommandQueue::Payload).json().null())
                     .col(
                         ColumnDef::new(CommandQueue::Status)
@@ -27,10 +35,19 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default("pending"),
                     )
-                    .col(ColumnDef::new(CommandQueue::CreatedAt).date_time().not_null())
+                    .col(
+                        ColumnDef::new(CommandQueue::CreatedAt)
+                            .date_time()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(CommandQueue::SentAt).date_time().null())
                     .col(ColumnDef::new(CommandQueue::Error).string().null())
-                    .col(ColumnDef::new(CommandQueue::RetryCount).integer().not_null().default(0))
+                    .col(
+                        ColumnDef::new(CommandQueue::RetryCount)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
                     .to_owned(),
             )
             .await

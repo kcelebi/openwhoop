@@ -38,6 +38,13 @@ pub enum WhoopData {
         enabled: bool,
         unix: u32,
     },
+    /// Response to [`CommandNumber::GetBatteryLevel`](crate::constants::CommandNumber::GetBatteryLevel).
+    BatteryLevel {
+        /// Best-effort 0–100; `None` if no plausible percentage byte is found.
+        percent: Option<u8>,
+        /// Remaining bytes after the CommandResponse prefix (hex).
+        raw_tail_hex: String,
+    },
 }
 
 impl WhoopData {
@@ -55,8 +62,9 @@ impl WhoopData {
                     CommandNumber::ReportVersionInfo => {
                         Self::parse_report_version_info(packet.data)
                     }
-                    CommandNumber::GetAlarmTime => {
-                        Self::parse_alarm_time_response(packet.data)
+                    CommandNumber::GetAlarmTime => Self::parse_alarm_time_response(packet.data),
+                    CommandNumber::GetBatteryLevel => {
+                        Self::parse_battery_level_response(packet.data)
                     }
                     _ => Err(WhoopError::Unimplemented),
                 }
@@ -385,13 +393,39 @@ impl WhoopData {
         let unix = data.read_u32_le()?;
         Ok(Self::AlarmInfo { enabled, unix })
     }
+
+    fn parse_battery_level_response(mut data: Vec<u8>) -> Result<Self, WhoopError> {
+        let _ = data.read::<3>()?; // CommandResponse prefix (same pattern as alarm)
+        let raw_tail_hex = hex::encode(&data);
+        // Observed on hardware: first byte is often a subtype/status (e.g. 3), and the
+        // percentage the official app shows is the second byte (e.g. 0x4D = 77). When only
+        // one byte remains, treat it as SOC. If both bytes look like 0–100, prefer the
+        // second when it is greater than the first (disambiguates [3, 77] vs [77, 3]).
+        let percent = match data.as_slice() {
+            [] => None,
+            [b0] => (*b0 <= 100).then_some(*b0),
+            [b0, b1, ..] => {
+                if *b1 <= 100 && (*b1 > *b0 || *b0 > 100) {
+                    Some(*b1)
+                } else if *b0 <= 100 {
+                    Some(*b0)
+                } else {
+                    None
+                }
+            }
+        };
+        Ok(Self::BatteryLevel {
+            percent,
+            raw_tail_hex,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
         WhoopPacket,
-        constants::{MetadataType, PacketType},
+        constants::{CommandNumber, MetadataType, PacketType},
         whoop_data::{
             WhoopData,
             history::{HistoryReading, ImuSample},
@@ -2185,5 +2219,59 @@ mod tests {
                 boylston: String::from("17.2.2.0")
             }
         )
+    }
+
+    #[test]
+    fn parse_battery_level_status_byte_then_soc() {
+        let packet = WhoopPacket::new(
+            PacketType::CommandResponse,
+            0,
+            CommandNumber::GetBatteryLevel.as_u8(),
+            vec![0x00, 0x00, 0x00, 0x03, 0x4D],
+        );
+        let data = WhoopData::from_packet(packet).expect("battery");
+        assert_eq!(
+            data,
+            WhoopData::BatteryLevel {
+                percent: Some(77),
+                raw_tail_hex: "034d".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_battery_level_single_payload_byte() {
+        let packet = WhoopPacket::new(
+            PacketType::CommandResponse,
+            0,
+            CommandNumber::GetBatteryLevel.as_u8(),
+            vec![0x00, 0x00, 0x00, 55],
+        );
+        let data = WhoopData::from_packet(packet).expect("battery");
+        assert_eq!(
+            data,
+            WhoopData::BatteryLevel {
+                percent: Some(55),
+                raw_tail_hex: "37".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_battery_level_soc_first_when_second_is_smaller() {
+        let packet = WhoopPacket::new(
+            PacketType::CommandResponse,
+            0,
+            CommandNumber::GetBatteryLevel.as_u8(),
+            vec![0x00, 0x00, 0x00, 77, 0x03],
+        );
+        let data = WhoopData::from_packet(packet).expect("battery");
+        assert_eq!(
+            data,
+            WhoopData::BatteryLevel {
+                percent: Some(77),
+                raw_tail_hex: "4d03".into(),
+            }
+        );
     }
 }
