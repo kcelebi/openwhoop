@@ -1,19 +1,25 @@
 #[macro_use]
 extern crate log;
 
+mod app_state;
+mod live_server;
+mod studio;
+
 use std::{
     io,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use anyhow::anyhow;
+#[cfg(target_os = "linux")]
+use btleplug::api::BDAddr;
 use btleplug::{
-    api::{BDAddr, Central, Manager as _, Peripheral as _, ScanFilter},
+    api::{Central, Manager as _, Peripheral as _, ScanFilter},
     platform::{Adapter, Manager, Peripheral},
 };
 use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, TimeDelta, Utc};
@@ -22,14 +28,17 @@ use clap_complete::{Shell, generate};
 use openwhoop_entities::packets;
 use dotenv::dotenv;
 use openwhoop::{
-    OpenWhoop, WhoopDevice,
+    OpenWhoop, StudioDeviceJob, WhoopDevice,
     algo::{ExerciseMetrics, SleepConsistencyAnalyzer},
     db::DatabaseHandler,
     types::activities::{ActivityType, SearchActivityPeriods},
 };
-use tokio::time::sleep;
+use tokio::sync::{broadcast, mpsc};
+use tokio::time::{sleep, timeout};
 use openwhoop::api;
 use openwhoop_codec::{WhoopPacket, constants::WHOOP_SERVICE};
+
+use crate::app_state::AppState;
 
 #[cfg(target_os = "linux")]
 pub type DeviceId = BDAddr;
@@ -41,8 +50,9 @@ pub type DeviceId = String;
 pub struct OpenWhoopCli {
     #[arg(env, long)]
     pub debug_packets: bool,
-    #[arg(env, long)]
-    pub database_url: String,
+    /// SQLite or Postgres URL. Not used by `scan`, `completions`, or `download-firmware`.
+    #[arg(env = "DATABASE_URL", long = "database-url")]
+    pub database_url: Option<String>,
     #[cfg(target_os = "linux")]
     #[arg(env, long)]
     pub ble_interface: Option<String>,
@@ -62,6 +72,17 @@ pub enum OpenWhoopCommand {
     DownloadHistory {
         #[arg(long, env)]
         whoop: DeviceId,
+    },
+    ///
+    /// Hold a BLE sync session and stream parsed heart-rate / metadata as JSON over WebSocket.
+    /// Optional DATABASE_URL for remote DB (e.g., Supabase). Without it, runs in thin proxy mode.
+    /// Set OPENWHOOP_STUDIO_BIND=0.0.0.0 for network access (Tailscale).
+    ///
+    LiveServer {
+        #[arg(long, env)]
+        whoop: DeviceId,
+        #[arg(long, default_value_t = 3848)]
+        port: u16,
     },
     ///
     /// Reruns the packet processing on stored packets
@@ -164,6 +185,39 @@ pub enum OpenWhoopCommand {
         #[arg(long, default_value = "./firmware")]
         output_dir: String,
     },
+    ///
+    /// Agent CLI: control Whoop via HTTP API (requires live-server running)
+    ///
+    Agent {
+        #[clap(subcommand)]
+        command: AgentCommand,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum AgentCommand {
+    /// Trigger instant buzzer/haptic feedback on the Whoop
+    Buzzer,
+    /// Get current battery level
+    Battery,
+    /// Get current alarm setting
+    GetAlarm,
+    /// Set alarm (accepts same formats as set-alarm)
+    SetAlarm { alarm_time: AlarmTime },
+    /// Clear any set alarm
+    ClearAlarm,
+    /// List scheduled alarms from database
+    ListAlarms,
+    /// Create a new scheduled alarm (cron expression or one-time)
+    CreateAlarm {
+        label: String,
+        /// Alarm kind: "cron" or "one-time"
+        kind: String,
+        /// Cron expression (e.g., "0 7 * * *") or Unix timestamp for one-time
+        schedule: String,
+    },
+    /// Delete a scheduled alarm by ID
+    DeleteAlarm { id: i32 },
 }
 
 #[tokio::main]
@@ -238,6 +292,13 @@ async fn scan_command(
     adapter: &Adapter,
     device_id: Option<DeviceId>,
 ) -> anyhow::Result<Peripheral> {
+    if let Some(id) = device_id.as_ref() {
+        info!(
+            "Scanning for Whoop matching {:?} — keep the strap on and nearby (this can take a minute if it is sleeping)",
+            id
+        );
+    }
+
     adapter
         .start_scan(ScanFilter {
             services: vec![WHOOP_SERVICE],
@@ -274,13 +335,32 @@ async fn scan_command(
                 let Some(name) = properties.local_name else {
                     continue;
                 };
-                if sanitize_name(&name).starts_with(device_id) {
+                let name = sanitize_name(&name);
+                // `starts_with`: e.g. WHOOP=WHOOP 4C0639073
+                // `contains` (suffix length >= 6): e.g. WHOOP=4C0639073 when name is WHOOP 4C0639073
+                let id = device_id.as_str();
+                if name.starts_with(id) || (id.len() >= 6 && name.contains(id)) {
                     return Ok(peripheral);
                 }
             }
         }
 
         sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn scan_command_with_timeout(
+    adapter: &Adapter,
+    device_id: DeviceId,
+    wait: Duration,
+) -> anyhow::Result<Option<Peripheral>> {
+    match timeout(wait, scan_command(adapter, Some(device_id))).await {
+        Ok(Ok(p)) => Ok(Some(p)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            let _ = adapter.stop_scan().await;
+            Ok(None)
+        }
     }
 }
 
@@ -387,12 +467,38 @@ impl OpenWhoopCli {
             return download_firmware(email, password, device_name, maxim, nordic, output_dir).await;
         }
 
+        match &self.subcommand {
+            OpenWhoopCommand::Completions { shell } => {
+                let mut command = OpenWhoopCli::command();
+                let bin_name = command.get_name().to_string();
+                generate(*shell, &mut command, bin_name, &mut io::stdout());
+                return Ok(());
+            }
+            OpenWhoopCommand::Scan => {
+                let adapter = self.create_ble_adapter().await?;
+                scan_command(&adapter, None).await?;
+                return Ok(());
+            }
+            OpenWhoopCommand::LiveServer { .. } => {
+                // LiveServer can run with optional DATABASE_URL
+                // Without DB: runs in thin proxy mode (device control only)
+                // With DB: also serves insights, alarm schedules
+            }
+            _ => {}
+        }
+
+        let database_url = self.database_url.as_deref().ok_or_else(|| {
+            anyhow!(
+                "DATABASE_URL or --database-url is required for this command (not needed for `scan` or `completions`)"
+            )
+        })?;
+
         let adapter = self.create_ble_adapter().await?;
-        let db_handler = DatabaseHandler::new(self.database_url).await;
+        let db_handler = DatabaseHandler::new(database_url.to_owned()).await;
 
         match self.subcommand {
-            OpenWhoopCommand::Scan => {
-                scan_command(&adapter, None).await?;
+            OpenWhoopCommand::Scan | OpenWhoopCommand::Completions { .. } => {
+                unreachable!("handled before database init")
             }
             OpenWhoopCommand::DownloadHistory { whoop } => {
                 let peripheral = scan_command(&adapter, Some(whoop)).await?;
@@ -426,6 +532,159 @@ impl OpenWhoopCli {
                     } else {
                         whoop.connect().await?;
                         sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+            OpenWhoopCommand::LiveServer { whoop, port } => {
+                // live-server requires a database for storing packets/readings
+                // Use local SQLite for laptop, or remote Postgres for thin proxy with remote DB
+                let database_url = self.database_url.as_deref().ok_or_else(|| {
+                    anyhow!("DATABASE_URL is required for live-server (use local SQLite or remote Postgres)")
+                })?;
+                let db_handler = DatabaseHandler::new(database_url.to_owned()).await;
+
+                let (live_tx, _) = broadcast::channel::<String>(512);
+                let live_hr_snapshot = Arc::new(Mutex::new(None::<String>));
+                let should_exit = Arc::new(AtomicBool::new(false));
+                let se = should_exit.clone();
+                ctrlc::set_handler(move || {
+                    println!("Received CTRL+C!");
+                    se.store(true, Ordering::SeqCst);
+                })?;
+
+                let (job_tx, mut job_rx) = mpsc::channel::<StudioDeviceJob>(32);
+                let app_state = AppState {
+                    db: Some(db_handler.clone()),
+                    ws_tx: live_tx.clone(),
+                    last_hr_json: live_hr_snapshot.clone(),
+                    job_tx,
+                };
+                let _server = tokio::spawn(async move {
+                    if let Err(e) = live_server::run(app_state, port).await {
+                        error!("live server: {}", e);
+                    }
+                });
+                let mut session_seq: u64 = 0;
+                let mut scan_cycle: u32 = 0;
+
+                while !should_exit.load(Ordering::SeqCst) {
+                    scan_cycle = scan_cycle.saturating_add(1);
+                    session_seq = session_seq.saturating_add(1);
+                    let _ = live_tx.send(
+                        serde_json::json!({
+                            "type": "session_state",
+                            "state": "searching",
+                            "reason": "scan_cycle_start",
+                            "state_seq": session_seq,
+                            "scan_cycle": scan_cycle,
+                            "received_at_ms": Utc::now().timestamp_millis(),
+                        }).to_string(),
+                    );
+
+                    let Some(peripheral) = scan_command_with_timeout(
+                        &adapter,
+                        whoop.clone(),
+                        Duration::from_secs(60),
+                    )
+                    .await?
+                    else {
+                        session_seq = session_seq.saturating_add(1);
+                        let _ = live_tx.send(
+                            serde_json::json!({
+                                "type": "session_state",
+                                "state": "offline",
+                                "reason": "no_device_seen_in_scan_window",
+                                "state_seq": session_seq,
+                                "scan_cycle": scan_cycle,
+                                "received_at_ms": Utc::now().timestamp_millis(),
+                            }).to_string(),
+                        );
+                        sleep(Duration::from_secs(60)).await;
+                        continue;
+                    };
+
+                    let openwhoop = OpenWhoop::new(db_handler.clone())
+                        .with_live_broadcast(live_tx.clone())
+                        .with_live_hr_snapshot(live_hr_snapshot.clone());
+                    let mut device = WhoopDevice::with_openwhoop(
+                        peripheral,
+                        adapter.clone(),
+                        openwhoop,
+                        self.debug_packets,
+                    );
+                    let mut tracker = openwhoop::SessionTracker::default();
+                    tracker.state_seq = session_seq;
+                    device.emit_external_session_state(
+                        &mut tracker,
+                        openwhoop::SessionState::Connecting,
+                        "device_found",
+                    );
+
+                    if let Err(e) = device.connect().await {
+                        error!("connect failed: {}", e);
+                        device.emit_external_session_state(
+                            &mut tracker,
+                            openwhoop::SessionState::Reconnecting,
+                            "connect_failed",
+                        );
+                        sleep(Duration::from_secs(5)).await;
+                        session_seq = tracker.state_seq;
+                        continue;
+                    }
+                    let _ = live_tx.send(
+                        serde_json::json!({
+                            "type": "status",
+                            "message": "ble_connected"
+                        })
+                        .to_string(),
+                    );
+                    if let Err(e) = device.initialize().await {
+                        error!("initialize failed: {}", e);
+                        device.emit_external_session_state(
+                            &mut tracker,
+                            openwhoop::SessionState::Reconnecting,
+                            "initialize_failed",
+                        );
+                        sleep(Duration::from_secs(5)).await;
+                        session_seq = tracker.state_seq;
+                        continue;
+                    }
+                    let _ = live_tx.send(
+                        serde_json::json!({
+                            "type": "status",
+                            "message": "ble_subscribed"
+                        })
+                        .to_string(),
+                    );
+
+                    let result = device
+                        .sync_history_with_studio_jobs(
+                            should_exit.clone(),
+                            &mut job_rx,
+                            &mut tracker,
+                            scan_cycle,
+                        )
+                        .await;
+                    session_seq = tracker.state_seq;
+
+                    if let Ok(true) = device.is_connected().await {
+                        let _ = device.send_command(WhoopPacket::exit_high_freq_sync()).await;
+                    }
+
+                    if should_exit.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    if let Err(e) = result {
+                        error!("live session ended: {}", e);
+                        device.emit_external_session_state(
+                            &mut tracker,
+                            openwhoop::SessionState::Reconnecting,
+                            "session_error",
+                        );
+                        session_seq = tracker.state_seq;
+                        sleep(Duration::from_secs(5)).await;
+                        continue;
                     }
                 }
             }
@@ -613,23 +872,108 @@ impl OpenWhoopCli {
                     .await?;
             }
             OpenWhoopCommand::Sync { remote } => {
-                let remote_db = DatabaseHandler::new(remote).await;
+                let remote_db = DatabaseHandler::new(remote.clone()).await;
                 let sync = openwhoop::db::sync::DatabaseSync::new(
                     db_handler.connection(),
                     remote_db.connection(),
                 );
                 sync.run().await?;
             }
-            OpenWhoopCommand::Completions { shell } => {
-                let mut command = OpenWhoopCli::command();
-                let bin_name = command.get_name().to_string();
-                generate(shell, &mut command, bin_name, &mut io::stdout());
-            }
             OpenWhoopCommand::DownloadFirmware { .. } => {
                 unreachable!("handled before BLE/DB init")
             }
+            OpenWhoopCommand::Agent { ref command } => {
+                self.run_agent_command(command.clone()).await?;
+            }
         }
 
+        Ok(())
+    }
+
+    async fn run_agent_command(&self, command: AgentCommand) -> anyhow::Result<()> {
+        let studio_url = std::env::var("OPENWHOOP_STUDIO_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3848".to_string());
+        let client = reqwest::Client::new();
+
+        match command {
+            AgentCommand::Buzzer => {
+                let resp = client.post(format!("{}/api/device/buzzer", studio_url))
+                    .send()
+                    .await?;
+                let json: serde_json::Value = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+            AgentCommand::Battery => {
+                let resp = client.post(format!("{}/api/device/battery", studio_url))
+                    .send()
+                    .await?;
+                let json: serde_json::Value = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+            AgentCommand::GetAlarm => {
+                let resp = client.get(format!("{}/api/device/alarm", studio_url))
+                    .send()
+                    .await?;
+                let json: serde_json::Value = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+            AgentCommand::SetAlarm { alarm_time } => {
+                let time = alarm_time.unix();
+                let now = Utc::now();
+                if time < now {
+                    anyhow::bail!("Time {} is in past", time.format("%Y-%m-%d %H:%M:%S"));
+                }
+                let unix = u32::try_from(time.timestamp())?;
+                let resp = client.post(format!("{}/api/device/alarm", studio_url))
+                    .json(&serde_json::json!({ "unix": unix }))
+                    .send()
+                    .await?;
+                let json: serde_json::Value = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+            AgentCommand::ClearAlarm => {
+                let resp = client.post(format!("{}/api/device/alarm/clear", studio_url))
+                    .send()
+                    .await?;
+                let json: serde_json::Value = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+            AgentCommand::ListAlarms => {
+                let resp = client.get(format!("{}/api/alarms", studio_url))
+                    .send()
+                    .await?;
+                let json: serde_json::Value = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+            AgentCommand::CreateAlarm { label, kind, schedule } => {
+                let (cron_expr, one_time_unix) = match kind.as_str() {
+                    "cron" => (Some(schedule.clone()), None),
+                    "one-time" => {
+                        let ts: i64 = schedule.parse()?;
+                        (None, Some(ts))
+                    }
+                    _ => anyhow::bail!("kind must be 'cron' or 'one-time'"),
+                };
+                let resp = client.post(format!("{}/api/alarms", studio_url))
+                    .json(&serde_json::json!({
+                        "label": label,
+                        "kind": kind,
+                        "cron_expr": cron_expr,
+                        "one_time_unix": one_time_unix,
+                    }))
+                    .send()
+                    .await?;
+                let json: serde_json::Value = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+            AgentCommand::DeleteAlarm { id } => {
+                let resp = client.delete(format!("{}/api/alarms/{}", studio_url, id))
+                    .send()
+                    .await?;
+                let json: serde_json::Value = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+        }
         Ok(())
     }
 
@@ -646,6 +990,7 @@ impl OpenWhoopCli {
         Self::default_adapter(&manager).await
     }
 
+    #[cfg(target_os = "linux")]
     async fn adapter_from_name(manager: &Manager, interface: &str) -> anyhow::Result<Adapter> {
         let adapters = manager.adapters().await?;
         let mut c_adapter = Err(anyhow!("Adapter: `{}` not found", interface));
