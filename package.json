@@ -1,0 +1,32 @@
+{
+  "name": "openwhoop",
+  "version": "0.1.0",
+  "description": "CLI to control Whoop devices via Bluetooth, with remote scheduling via Tailscale",
+  "author": "Kaya Celebi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kcelebi/openwhoop.git"
+  },
+  "keywords": [
+    "whoop",
+    "bluetooth",
+    "wearable",
+    "cli",
+    "health",
+    "fitness"
+  ],
+  "bin": {
+    "openwhoop": "./bin/openwhoop"
+  },
+  "scripts": {
+    "postinstall": "node scripts/download-binary.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "bin/",
+    "scripts/"
+  ]
+}
