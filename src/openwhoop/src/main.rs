@@ -538,17 +538,23 @@ impl OpenWhoopCli {
                 return Ok(());
             }
             OpenWhoopCommand::LiveServer { .. } => {
-                // LiveServer can run with optional DATABASE_URL
-                // Without DB: runs in thin proxy mode (device control only)
-                // With DB: also serves insights, alarm schedules
+                // LiveServer runs separately - has its own match arm later
+                return Ok(());
+            }
+            OpenWhoopCommand::Scheduler { .. } => {
+                // Scheduler runs separately - has its own match arm later
+                return Ok(());
+            }
+            OpenWhoopCommand::DownloadFirmware { .. } => {
+                // No BLE/DB needed - downloads from WHOOP API
+                return Ok(());
             }
             _ => {}
         }
 
+        // For other commands, DATABASE_URL is required
         let database_url = self.database_url.as_deref().ok_or_else(|| {
-            anyhow!(
-                "DATABASE_URL or --database-url is required for this command (not needed for `scan` or `completions`)"
-            )
+            anyhow!("DATABASE_URL or --database-url is required for this command")
         })?;
 
         let adapter = self.create_ble_adapter().await?;
@@ -558,7 +564,13 @@ impl OpenWhoopCli {
             OpenWhoopCommand::Scan | OpenWhoopCommand::Completions { .. } => {
                 unreachable!("handled before database init")
             }
+            OpenWhoopCommand::LiveServer { .. } => {
+                unreachable!("handled before database init")
+            }
             OpenWhoopCommand::Scheduler { .. } => {
+                unreachable!("handled before database init")
+            }
+            OpenWhoopCommand::DownloadFirmware { .. } => {
                 unreachable!("handled before database init")
             }
             OpenWhoopCommand::DownloadHistory { whoop } => {
@@ -597,12 +609,11 @@ impl OpenWhoopCli {
                 }
             }
             OpenWhoopCommand::LiveServer { whoop, port } => {
-                // live-server requires a database for storing packets/readings
-                // Use local SQLite for laptop, or remote Postgres for thin proxy with remote DB
-                let database_url = self.database_url.as_deref().ok_or_else(|| {
-                    anyhow!("DATABASE_URL is required for live-server (use local SQLite or remote Postgres)")
-                })?;
-                let db_handler = DatabaseHandler::new(database_url.to_owned()).await;
+                // LiveServer requires DATABASE_URL for database operations
+                // If not provided, use local SQLite file in current directory
+                let db_url = std::env::var("DATABASE_URL")
+                    .unwrap_or_else(|_| "sqlite:openwhoop.db".to_string());
+                let db_handler = DatabaseHandler::new(db_url).await;
 
                 let (live_tx, _) = broadcast::channel::<String>(512);
                 let live_hr_snapshot = Arc::new(Mutex::new(None::<String>));
@@ -940,9 +951,6 @@ impl OpenWhoopCli {
                     remote_db.connection(),
                 );
                 sync.run().await?;
-            }
-            OpenWhoopCommand::DownloadFirmware { .. } => {
-                unreachable!("handled before BLE/DB init")
             }
             OpenWhoopCommand::Scheduler {
                 interval_secs,

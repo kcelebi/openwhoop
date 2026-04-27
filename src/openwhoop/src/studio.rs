@@ -122,9 +122,20 @@ async fn insights_exercise(
 }
 
 async fn insights_vitals(State(app): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+    // Try in-memory first (thin proxy mode), then database if available
+    if let Some(last_hr) = app.last_hr_json.lock().unwrap().as_ref() {
+        let parsed: Value = serde_json::from_str(last_hr).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid JSON in cache".into(),
+            )
+        })?;
+        return Ok(Json(parsed));
+    }
+    // Fall back to database
     let db = app.db.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available - run with DATABASE_URL or connect to AWS".into(),
+        "Database not available and no live HR data yet".into(),
     ))?;
     let rows = heart_rate::Entity::find()
         .order_by_desc(heart_rate::Column::Time)
