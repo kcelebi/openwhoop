@@ -192,6 +192,13 @@ pub enum OpenWhoopCommand {
         #[clap(subcommand)]
         command: AgentCommand,
     },
+    ///
+    /// Queue commands for offline laptop reconnection
+    ///
+    Queue {
+        #[clap(subcommand)]
+        command: QueueCommand,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -218,6 +225,43 @@ pub enum AgentCommand {
     },
     /// Delete a scheduled alarm by ID
     DeleteAlarm { id: i32 },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum QueueCommand {
+    /// List pending commands in the queue
+    List {
+        /// Device ID to filter by (optional)
+        #[arg(long)]
+        device_id: Option<String>,
+    },
+    /// Push a command to the queue
+    Push {
+        /// Device ID
+        #[arg(long)]
+        device_id: String,
+        /// Command type: buzzer, set-alarm, clear-alarm
+        #[arg(long)]
+        command: String,
+        /// Optional payload as JSON (e.g., '{"unix": 1234567890}')
+        #[arg(long)]
+        payload: Option<String>,
+    },
+    /// Process and send pending commands to live-server
+    Process {
+        /// Device ID
+        #[arg(long)]
+        device_id: String,
+        /// URL of the live-server (default: http://127.0.0.1:3848)
+        #[arg(long)]
+        studio_url: Option<String>,
+    },
+    /// Clear failed commands
+    ClearFailed {
+        /// Device ID
+        #[arg(long)]
+        device_id: String,
+    },
 }
 
 #[tokio::main]
@@ -885,6 +929,9 @@ impl OpenWhoopCli {
             OpenWhoopCommand::Agent { ref command } => {
                 self.run_agent_command(command.clone()).await?;
             }
+            OpenWhoopCommand::Queue { ref command } => {
+                self.run_queue_command(command.clone()).await?;
+            }
         }
 
         Ok(())
@@ -972,6 +1019,94 @@ impl OpenWhoopCli {
                     .await?;
                 let json: serde_json::Value = resp.json().await?;
                 println!("{}", serde_json::to_string_pretty(&json)?);
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_queue_command(&self, command: QueueCommand) -> anyhow::Result<()> {
+        let database_url = self.database_url.as_deref().ok_or_else(|| {
+            anyhow!("DATABASE_URL or --database-url is required for queue commands")
+        })?;
+        let db = DatabaseHandler::new(database_url.to_owned()).await;
+
+        match command {
+            QueueCommand::List { device_id } => {
+                match device_id {
+                    Some(id) => {
+                        let pending = db.list_pending_commands(&id).await?;
+                        println!("Pending commands for device '{}':", id);
+                        for cmd in pending {
+                            println!("  [{}] {} - {:?}", cmd.id, cmd.command_type, cmd.payload);
+                        }
+                    }
+                    None => {
+                        println!("Listing all pending commands requires device_id for now");
+                    }
+                }
+            }
+            QueueCommand::Push { device_id, command, payload } => {
+                let payload_json: Option<serde_json::Value> = payload
+                    .as_ref()
+                    .and_then(|p| serde_json::from_str(p).ok());
+                let id = db.push_command(&device_id, &command, payload_json).await?;
+                println!("Queued command {} (id={})", command, id);
+            }
+            QueueCommand::Process { device_id, studio_url } => {
+                let url = studio_url.unwrap_or_else(|| "http://127.0.0.1:3848".to_string());
+                let pending = db.list_pending_commands(&device_id).await?;
+                
+                if pending.is_empty() {
+                    println!("No pending commands for device '{}'", device_id);
+                    return Ok(());
+                }
+
+                println!("Processing {} pending commands for device '{}'...", pending.len(), device_id);
+                let client = reqwest::Client::new();
+                
+                for cmd in pending {
+                    let result = match cmd.command_type.as_str() {
+                        "buzzer" => client.post(format!("{}/api/device/buzzer", url)).send().await,
+                        "set-alarm" => {
+                            let payload = cmd.payload.as_ref();
+                            let unix = payload.and_then(|p| p.get("unix")).and_then(|v| v.as_u64());
+                            match unix {
+                                Some(u) => client.post(format!("{}/api/device/alarm", url))
+                                    .json(&serde_json::json!({ "unix": u32::try_from(u)? }))
+                                    .send()
+                                    .await,
+                                None => {
+                                    println!("Skipping set-alarm: missing unix in payload");
+                                    continue;
+                                }
+                            }
+                        }
+                        "clear-alarm" => client.post(format!("{}/api/device/alarm/clear", url)).send().await,
+                        _ => {
+                            println!("Unknown command type: {}", cmd.command_type);
+                            continue;
+                        }
+                    };
+
+                    match result {
+                        Ok(resp) if resp.status().is_success() => {
+                            db.mark_command_sent(cmd.id).await?;
+                            println!("  [{}] {} - sent successfully", cmd.id, cmd.command_type);
+                        }
+                        Ok(resp) => {
+                            let err = format!("HTTP {}", resp.status());
+                            db.mark_command_failed(cmd.id, &err).await?;
+                            println!("  [{}] {} - failed: {}", cmd.id, cmd.command_type, err);
+                        }
+                        Err(e) => {
+                            db.mark_command_failed(cmd.id, &e.to_string()).await?;
+                            println!("  [{}] {} - error: {}", cmd.id, cmd.command_type, e);
+                        }
+                    }
+                }
+            }
+            QueueCommand::ClearFailed { device_id } => {
+                println!("Clearing failed commands for device '{}' (not implemented yet)", device_id);
             }
         }
         Ok(())

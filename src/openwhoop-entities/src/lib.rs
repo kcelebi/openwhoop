@@ -2,6 +2,8 @@
 
 pub mod prelude;
 
+pub mod alarm_schedules;
+pub mod command_queue;
 pub mod activities;
 pub mod heart_rate;
 pub mod packets;
