@@ -778,6 +778,14 @@ impl OpenWhoopCli {
                         .await;
                     session_seq = tracker.state_seq;
 
+                    if result.is_err() {
+                        // A timed-out BLE operation can leave CoreBluetooth
+                        // claiming the old link is connected. Release it before
+                        // scanning/reconnecting rather than retrying encryption
+                        // on the same stalled link indefinitely.
+                        let _ = timeout(Duration::from_secs(5), device.disconnect()).await;
+                    }
+
                     let _ = timeout(Duration::from_secs(5), async {
                         if let Ok(true) = device.is_connected().await {
                             let _ = device

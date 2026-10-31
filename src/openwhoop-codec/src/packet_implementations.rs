@@ -7,6 +7,14 @@ use crate::{
 };
 
 impl WhoopPacket {
+    pub fn abort_history() -> WhoopPacket {
+        WhoopPacket::new(
+            PacketType::Command,
+            0,
+            CommandNumber::AbortHistoricalTransmits.as_u8(),
+            vec![],
+        )
+    }
     pub fn enter_high_freq_sync() -> WhoopPacket {
         WhoopPacket::new(
             PacketType::Command,
@@ -258,6 +266,14 @@ mod tests {
         assert_command_packet(&p, CommandNumber::SendHistoricalData);
         assert_eq!(p.data, vec![0x00]);
         assert_roundtrip(&p);
+    }
+
+    #[test]
+    fn history_abort_is_a_standalone_command() {
+        let p = WhoopPacket::abort_history();
+        assert_command_packet(&p, CommandNumber::AbortHistoricalTransmits);
+        assert!(p.data.is_empty());
+        assert!(p.framed_packet().is_ok());
     }
 
     #[test]

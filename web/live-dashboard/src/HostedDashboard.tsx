@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { createClient, type Session } from "@supabase/supabase-js";
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip } from "recharts";
 import "./hosted.css";
+const DesktopPulse = lazy(() => import("./DesktopPulse"));
 
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL as string,
@@ -74,6 +75,13 @@ function repeatLabel(days: number[]): string {
 }
 
 export default function HostedDashboard() {
+  const [desktop, setDesktop] = useState(() => window.matchMedia("(min-width: 901px) and (hover: hover) and (pointer: fine)").matches);
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 901px) and (hover: hover) and (pointer: fine)");
+    const update = () => setDesktop(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
   const [session, setSession] = useState<Session | null>(null);
   const [email, setEmail] = useState("");
   const [message, setMessage] = useState("");
@@ -208,7 +216,7 @@ export default function HostedDashboard() {
       <button disabled={busy}>Send sign-in link</button>
     </form><p role="status">{message}</p></main>;
 
-  return <main className="hosted">
+  return <main className={`hosted${desktop && tab === "pulse" ? " desktop-history" : ""}`}>
     <header className="hosted-header"><div><div className="brand-line"><img src={`${import.meta.env.BASE_URL}k-mark.svg`} alt="" /><small>OPENWHOOP</small></div><h1>{tab === "pulse" ? "Pulse" : "Alarms"}</h1></div>
       <div className="header-right"><div className="header-status"><span className="battery-state" aria-label={battery == null ? "Whoop battery unavailable" : `Whoop battery ${battery}%`}><span className="battery-icon" aria-hidden="true" />{battery == null ? "—" : `${battery}%`}</span><span className="relay-state"><span className={`led ${live ? "on" : ""}`} />{live ? "Live" : macOnline ? "Mac online" : "Mac offline"}</span></div>
         <button className="text-button" onClick={() => void supabase.auth.signOut()}>Sign out</button></div></header>
@@ -217,12 +225,12 @@ export default function HostedDashboard() {
 
     {tab === "pulse" ? <><section className="hero"><small>HEART RATE</small><div className="bpm">{bpm ?? "—"}<span> BPM</span></div>
       <p>{live ? "Live from your Whoop" : "Waiting for the next strap sample"}</p></section>
-      <section className="panel"><h2>Recent pulse</h2><div className="chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={samples}>
+      {desktop ? <Suspense fallback={<section className="panel">Loading pulse history…</section>}><DesktopPulse client={supabase} owner={session.user.id} /></Suspense> : <section className="panel"><h2>Recent pulse</h2><div className="chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={samples}>
         <XAxis dataKey="recorded_at_ms" tickFormatter={value => new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} minTickGap={35} />
         <YAxis domain={["dataMin - 10", "dataMax + 10"]} width={35} />
         <Tooltip labelFormatter={value => new Date(Number(value)).toLocaleString()} formatter={value => [`${value} BPM`, "Heart rate"]} />
         <Line dataKey="bpm" type="monotone" stroke="#67e8a0" strokeWidth={2} dot={false} isAnimationActive={false} />
-      </LineChart></ResponsiveContainer></div></section></> : <>
+      </LineChart></ResponsiveContainer></div></section>}</> : <>
       <section className="alarm-heading"><p>{!nextAlarm ? "No alarm armed" : onStrap ? `Synced to Whoop · ${displayTime(cronParts(nextAlarm).time)}` : macOnline ? "Checking Whoop alarm…" : "Mac offline · waiting to sync"}</p>
         <button className="add-alarm" onClick={() => setDraft(blankDraft())}>+ Add</button></section>
       {draft && <section className="panel alarm-editor"><div className="editor-title"><h2>{draft.id ? "Edit alarm" : "New alarm"}</h2><button className="text-button" onClick={() => setDraft(null)}>Cancel</button></div>

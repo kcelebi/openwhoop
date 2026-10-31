@@ -7,3 +7,5 @@ pub mod sync;
 mod type_impl;
 
 pub use type_impl::history::SearchHistory;
+mod telemetry;
+pub use telemetry::TelemetryRow;

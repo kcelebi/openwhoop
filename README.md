@@ -83,9 +83,11 @@ For local operation, build the binary and use an ignored `.env.cloud` containing
 
 On the configured Mac, `scripts/install-mac-relay.sh` installs a per-user LaunchAgent that restarts the relay after login and prevents idle sleep while it runs. It uses `~/.local/share/openwhoop/relay.sqlite` and keeps `.env.cloud` local. Closing a laptop lid can still suspend Bluetooth and prevent the Mac from advancing a sequence.
 
+**After rebuilding on macOS:** the unsigned/ad-hoc executable's code hash changes. macOS can invalidate its previous background Bluetooth grant even while the Settings switch still looks enabled. If the LaunchAgent stalls at “Waiting on adapter connect” but a terminal scan works, check the TCC logs for “Failed to match existing code requirement”, then reauthorize **openwhoop** in Privacy & Security → Bluetooth (authentication may be required) and restart the relay. A rebuild is not operationally accepted until the background agent records fresh samples. Avoid rebuilding the running executable during unattended collection. A stable trusted signing identity is needed to preserve authorization across binary updates.
+
 The installer also registers `com.openwhoop.watchdog`, which checks saved heart-rate progress every 30 seconds and restarts the relay after 90 seconds without progress. The BLE loop reconnects after 30 seconds without notifications, with bounded battery and control operations. Recovery may leave a gap in live samples; bulk historical import remains a separate operation.
 
-The Mac LaunchAgent sets `OPENWHOOP_HISTORY_SYNC=false` to prioritize alarm readback and live GATT heart rate over bulk history downloads. `live-server` otherwise keeps automatic history sync enabled. Use `download-history` separately when you want buffered readings imported; it may compete with alarm controls while it runs.
+The Mac LaunchAgent sets `OPENWHOOP_HISTORY_SYNC=false` to disable continuous bulk history catch-up. `OPENWHOOP_RICH_CAPTURE=true` instead requests buffered sensor windows periodically, with control-job priority and an alarm deadline guard. A standalone `live-server` otherwise keeps continuous history sync enabled. `download-history` remains available for a dedicated import session.
 
 When Supabase is configured, the Mac schedules only alarms synced from the hosted dashboard. Older schedules in its local SQLite database remain stored but cannot trigger an unseen alarm. A standalone `live-server` without Supabase continues to use local schedules.
 
@@ -400,3 +402,23 @@ openwhoop queue process --device-id XYZ --studio-url http://100.x.y.z:3848
 ```sh
 tailscale ip -4  # Or check Tailscale admin console
 ```
+
+### Rich telemetry and desktop insights
+
+The hosted **desktop Pulse** view (at least 901 CSS pixels, mouse/trackpad input) adds 1-hour, 24-hour, 7-day and custom history up to 31 days per query. Earlier/later navigation can browse the complete recorded archive. The current BPM remains live independently of the selected period. Server-side buckets retain average/minimum/maximum BPM, cap chart points, and preserve missing-data gaps. The mobile Pulse UI and Alarms UI are unchanged.
+
+The Mac relay persists **every received BLE notification** in a durable `telemetry_outbox` before decoding, including unknown/malformed packets. Normalized records preserve device UTC timestamps, received timestamps, source, RR intervals, IMU, every decoded sensor field, and standard GATT contact/energy/flags plus original RR ticks. Raw bytes remain available for later decoder changes. Raw and decoded records upload independently of alarm synchronization to owner-scoped `whoop_telemetry`; retries do not discard unacknowledged records. Identical normalized replays are idempotent. There is no automatic raw-data expiry.
+
+`OPENWHOOP_RICH_CAPTURE=true` enables periodic buffered-sensor collection while the standard GATT live stream runs. Requests defer within two minutes of the next enabled alarm and do not continuously restart an active historical transfer. A device-control job preempts the transfer with AbortHistoricalTransmits; persisted data remains intact and unacknowledged batches can replay. Firmware that omits HistoryComplete is handled by detecting a quiet historical channel. A failed session releases the old BLE link before reconnecting. This preserves the fields the strap actually emits; it does not fabricate missing readings or turn raw ADC values into calibrated SpO₂/temperature measurements. High-rate IMU fields are retained when emitted, without blindly toggling firmware collection modes.
+
+`scripts/install-mac-relay.sh` also installs **com.openwhoop.analysis**, which runs every minute separately from BLE/alarm control. It backfills the configured relay SQLite database and the repository's legacy `w.db`, preserves provenance, stores a local `insights.json`, and upserts owner-scoped daily reports. Late buffered readings trigger recomputation of the affected dates automatically. Legacy naive timestamps are interpreted using `OPENWHOOP_TIMEZONE` (default America/New_York), and the original timestamp/timezone assumption is retained. The old Postgres URL in `.env` is not used by the Mac relay and must be reachable separately before that archive can be imported.
+
+Analysis methods:
+
+- **Estimated sleep:** five-second median wrist z-angle; sustained angle variation within 5° over five contiguous minutes; report bouts at least 30 minutes long. This is a WHOOP-data adaptation of [van Hees et al. (2015)](https://doi.org/10.1371/journal.pone.0142533), not a validated WHOOP sleep score. It lacks the paper's participant sleep diary and may classify quiet wake as sleep. Gaps, missing motion and off-wrist readings break runs. Ongoing bouts are provisional. The noon-to-noon sleep window follows the configured timezone across DST.
+- **Activity:** report sustained pulse at least 120 BPM for 10 contiguous minutes, with no bridging across gaps. These are elevated-pulse periods, not confirmed exercise types or calorie estimates.
+- **RMSSD:** use recorded RR intervals only, require at least 120 intervals, break across gaps, and prefer historical RR over overlapping GATT/legacy RR within an epoch. No HRV is synthesized from BPM. Coverage and method version accompany results.
+
+Cards show collecting/partial results until the required signals arrive and update automatically thereafter. No personal training period is required. Live-only gaps cannot be reconstructed unless buffered device history later supplies them.
+
+Checks: `cargo test -p openwhoop-db -p openwhoop`, `/usr/bin/python3 -m unittest discover -s scripts -p 'test_*.py'`, and (from `web/live-dashboard`) `npm run typecheck`, `npm run test:hosted`, `GITHUB_PAGES=true npm run build`.
