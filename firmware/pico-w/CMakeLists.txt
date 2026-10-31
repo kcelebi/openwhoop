@@ -1,19 +1,21 @@
 cmake_minimum_required(VERSION 3.13)
-
-set(CMAKE_BUILD_TYPE Release)
-
-include(${PICO_SDK_PATH}/pico_sdk_init.cmake)
-project(pico_w C CXX)
-
+include(${PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+project(openwhoop_pico_bringup C CXX ASM)
 pico_sdk_init()
+add_executable(pico_w main.c)
+target_compile_options(pico_w PRIVATE -Wall -Wextra -Werror)
+target_include_directories(pico_w PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pico_w pico_stdlib pico_cyw43_arch_lwip_threadsafe_background pico_btstack_ble pico_btstack_cyw43)
+pico_enable_stdio_usb(pico_w 1)
+pico_enable_stdio_uart(pico_w 0)
+pico_set_program_name(pico_w "OpenWhoop Pico radio bring-up")
+pico_set_program_version(pico_w "0.1.0")
+pico_add_extra_outputs(pico_w)
 
-add_executable(pico_w
-    main.c
-)
-
-target_compile_options(pico_w PRIVATE -Wall -Wextra -O2)
-target_compile_definitions(pico_w PRIVATE PICO_W)
-target_include_directories(pico_w PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(pico_w pico_cyw43_arch_lwip_threadsafe_background pico_status_led hardware_timer)
-target_link_libraries(pico_w pico_runtime)
-target_link_options(pico_w PRIVATE -lrdimon)
+# Independent recovery probe isolates USB/cable problems from radio bring-up.
+add_executable(pico_usb_probe usb_probe.c)
+target_link_libraries(pico_usb_probe pico_stdlib)
+pico_enable_stdio_usb(pico_usb_probe 1)
+pico_enable_stdio_uart(pico_usb_probe 0)
+pico_set_program_name(pico_usb_probe "OpenWhoop USB probe")
+pico_add_extra_outputs(pico_usb_probe)

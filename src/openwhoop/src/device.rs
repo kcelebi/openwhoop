@@ -239,6 +239,13 @@ impl WhoopDevice {
         (SessionState::Live, streak)
     }
 
+    fn history_needs_catchup(last_history_ms: Option<u64>, now_ms: i64) -> bool {
+        // GATT live timestamps must not conceal a still-unfinished device archive.
+        last_history_ms.is_some_and(|ms| {
+            now_ms.saturating_sub(i64::try_from(ms).unwrap_or(i64::MAX)) > 120_000
+        })
+    }
+
     pub async fn connect(&mut self) -> anyhow::Result<()> {
         self.peripheral.connect().await?;
         let _ = self.adapter.stop_scan().await;
@@ -411,9 +418,10 @@ impl WhoopDevice {
         let rich_capture = std::env::var("OPENWHOOP_RICH_CAPTURE").is_ok_and(|v| v == "true");
         let mut rich_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(20),
-            Duration::from_secs(180),
+            Duration::from_secs(5),
         );
         rich_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut next_rich_request = Instant::now();
         let mut history_in_flight = history_sync;
         let mut history_last_rx: Option<Instant> = None;
 
@@ -432,6 +440,10 @@ impl WhoopDevice {
                         // Unacknowledged batches replay safely on the next window.
                         let _ = timeout(Duration::from_secs(2), self.send_command(WhoopPacket::abort_history())).await;
                         history_in_flight = false;
+                        let history_ms = self.whoop.last_history_packet.as_ref().map(|r| r.unix);
+                        if Self::history_needs_catchup(history_ms, Utc::now().timestamp_millis()) {
+                            next_rich_request = Instant::now() + Duration::from_secs(3);
+                        }
                         info!("Rich telemetry paused for device control");
                     }
                     timeout(Duration::from_secs(5), self.handle_studio_job(job))
@@ -478,7 +490,10 @@ impl WhoopDevice {
                         self.send_command(packet).await?;
                     }
                     let history_complete = self.whoop.take_history_refresh_requested();
-                    if history_complete { history_in_flight = false; }
+                    if history_complete {
+                        history_in_flight = false;
+                        next_rich_request = Instant::now() + Duration::from_secs(180);
+                    }
                     if history_complete && history_sync {
                         info!("HistoryComplete: issuing history_start for incremental window");
                         self.send_command(WhoopPacket::history_start()).await?;
@@ -499,14 +514,18 @@ impl WhoopDevice {
                     // not disable sensor collection forever while GATT HR runs.
                     if history_in_flight && history_last_rx.is_some_and(|t| t.elapsed() > Duration::from_secs(30)) {
                         history_in_flight = false;
+                        let history_ms = self.whoop.last_history_packet.as_ref().map(|r| r.unix);
+                        if Self::history_needs_catchup(history_ms, Utc::now().timestamp_millis()) {
+                            next_rich_request = Instant::now();
+                        }
                     }
-                    if !history_in_flight && self.studio_pending.is_none() {
+                    if !history_in_flight && self.studio_pending.is_none() && Instant::now() >= next_rich_request {
                         let now = Utc::now().timestamp();
                         let next = self.whoop.database.next_enabled_alarm_unix(now, false).await?;
                         if next.is_none_or(|unix| unix - now > 120) {
                             match timeout(Duration::from_secs(3), self.send_command(WhoopPacket::history_start())).await {
-                                Ok(Ok(())) => { history_in_flight = true; history_last_rx = Some(Instant::now()); info!("Rich telemetry: requested buffered sensor readings"); }
-                                _ => warn!("Rich telemetry request deferred after BLE timeout"),
+                                Ok(Ok(())) => { next_rich_request = Instant::now() + Duration::from_secs(180); history_in_flight = true; history_last_rx = Some(Instant::now()); info!("Rich telemetry: requested buffered sensor readings"); }
+                                _ => { next_rich_request = Instant::now() + Duration::from_secs(30); warn!("Rich telemetry request deferred after BLE timeout"); },
                             }
                         }
                     }
@@ -840,6 +859,14 @@ impl WhoopDevice {
 #[cfg(test)]
 mod tests {
     use super::{SessionState, WhoopDevice, standard_heart_rate_bpm};
+
+    #[test]
+    fn buffered_backlog_is_independent_of_fresh_live_samples() {
+        assert!(WhoopDevice::history_needs_catchup(Some(1_000), 500_000));
+        assert!(!WhoopDevice::history_needs_catchup(Some(450_000), 500_000));
+        assert!(!WhoopDevice::history_needs_catchup(None, 500_000));
+        assert!(!WhoopDevice::history_needs_catchup(Some(600_000), 500_000));
+    }
 
     #[test]
     fn standard_heart_rate_measurement_supports_8_and_16_bit_values() {

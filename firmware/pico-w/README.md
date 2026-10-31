@@ -1,56 +1,104 @@
-# Pico W — OpenWhoop BLE Relay (Phase 1, T1 spike)
+# OpenWhoop Pico W bring-up
 
-Proposed Raspberry Pi Pico W (RP2040 + CYW43439) relay. Current code only initializes CYW43
-and an LED; it has no BLE central, Whoop protocol, Wi-Fi connection, or HTTP forwarding.
-The Mac relay is the active implementation until hardware, cable, and firmware acceptance.
+This folder contains **diagnostic firmware, not the deployed relay**. The Mac
+continues to own the WHOOP connection, alarms, and cloud synchronization.
 
-## T1 spike plan
+## Hardware evidence (2026-10-31)
 
-1. Install toolchain (macOS host):
-   - `brew install cmake picotool libusb`
-   - SDK: clone https://github.com/raspberrypi/pico-sdk into `~/pico-sdk` and export `PICO_SDK_PATH`.
-   - **Toolchain note (working set, verified 2026-10-30):** use the xPack GNU Arm Embedded GCC
-     `arm-none-eabi-gcc` 12.2.1 (e.g. extracted from
-     `xpack-arm-none-eabi-gcc-12.2.1-1.2-darwin-arm64.tar.gz`) and point
-     `PICO_TOOLCHAIN_PATH` at it. The Arm official GCC 15.3 toolchain currently ships a newlib
-     build that the GNU ld in that package cannot process ("Unknown destination type (ARM/Thumb)").
-2. Bring-up: build & flash the stock Wi-Fi/blink example; verify USB serial output.
-3. BLE central: use `pico_cyw43_arch` BLE API to connect to Whoop service
-   `61080001-8d6d-82b8-614a-1c8cb0f8dcc6` and subscribe to notifies
-   (CMD_FROM_STRAP, EVENTS_FROM_STRAP, DATA_FROM_STRAP, MEMFAULT).
-4. Forward: on `HistoryReading` data → JSON → POST to backend ingest webhook (shared secret).
-5. Spike deliverable: Pico W receives HR data → backend writes to Supabase → read path returns BPM.
+- The replacement cable carries USB data: the board enumerates as `RP2 Boot`,
+  mounts `RPI-RP2`, and responds to picotool.
+- RP2040 B2, 2 MiB flash; Pico SDK 2.3.1 and xPack Arm GCC 12.2.1 build both targets.
+- The USB-only C probe prints repeated heartbeats. Cable/USB runtime acceptance passes.
+- The custom C radio image flashes/verifies, but its startup hangs; C radio runtime
+  is **not** accepted.
+- Official MicroPython 1.29.0 for Pico W boots and runs USB REPL normally. It
+  activated Wi-Fi and found 20 networks, activated BLE, and completed a passive
+  scan with 1,036 reports including 53 WHOOP advertisements. No Wi-Fi credentials
+  or cloud secrets are installed on the board.
+- Official firmware URL: https://micropython.org/resources/firmware/RPI_PICO_W-20260824-v1.29.0.uf2
+  SHA-256: `f918c0a082c6daf53e27998b7f990ba5f065db2e298b21a34024532a20786794`.
+- A controlled Mac/Pico handoff received six live BPM/RR notifications, verified
+  the CCCD write response, durably saved all six raw and decoded readings to the
+  local outbox, and restored the Mac. This is USB-hosted BLE acceptance, **not**
+  Pico-to-cloud-over-Wi-Fi acceptance.
+- A full flash backup was saved outside the repository before the first flash.
 
-See `docs/phase1-scoping.md` for the full Phase 1 context and milestone breakdown.
-
-## Build / flash
+## Build
 
 ```sh
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
+cmake -B firmware/pico-w/build -S firmware/pico-w \
   -DPICO_SDK_PATH=/Users/kayacelebi/pico-sdk \
   -DPICO_TOOLCHAIN_PATH=/Users/kayacelebi/xpack-arm/xpack-arm-none-eabi-gcc-12.2.1-1.2 \
   -DPICO_BOARD=pico_w
-cmake --build build
-picotool uf2 convert build/pico_w.elf /tmp/pico_w.uf2
-picotool load -f /tmp/pico_w.uf2
+cmake --build firmware/pico-w/build -j 6
 ```
 
-## Status
+The SDK generates UF2s directly. USB stdio is enabled, UART stdio disabled, and
+semihosting is not linked. `pico_usb_probe` prints a heartbeat once per second.
+`pico_w` initializes CYW43, scans for Wi-Fi networks without joining, and scans
+Bluetooth advertisements without connecting to or sending commands to the strap.
+It reports aggregate scan counts and WHOOP names, without printing nearby SSIDs.
 
-- [x] T1.1 Toolchain instructions and initial build spike
-- [ ] T1.2 Radio bring-up (flash + verify)
-- [ ] T1.3 BLE central spike (connect to Whoop)
-- [ ] T1.4 Forward to backend (webhook)
-- [ ] T1.5 Spike deliverable
+## Flash and inspect
 
-## T1.3/T1.4 implementation design (spike draft)
+Start with the USB-only image and verify serial output before testing radios:
 
-- BLE central: use C SDK `pico_cyw43_arch` BLE surface toward Whoop service
-  `61080001-8d6d-82b8-614a-1c8cb0f8dcc6`; subscribe to CMD_FROM_STRAP / EVENTS_FROM_STRAP /
-  DATA_FROM_STRAP / MEMFAULT notifies.
-- On `HistoryReading` data → JSON payload → POST to backend ingest webhook (shared secret).
+```sh
+picotool load -v firmware/pico-w/build/pico_usb_probe.uf2
+picotool reboot
+# Read /dev/cu.usbmodem* at 115200; expect repeated USB probe heartbeats.
+# Re-enter BOOTSEL, then:
+picotool load -v firmware/pico-w/build/pico_w.uf2
+picotool reboot
+```
 
-## Acceptance
+`-f` can request software reboot from a responsive SDK USB-stdio image. If it
+fails, use physical BOOTSEL. Do not run concurrent picotool/serial sessions while
+recovering an unresponsive image. A successful flash is not runtime acceptance.
 
-- **A1:** toolchain + radio + BLE central + forward + ingest → BPM returns. Not accepted: the
-  current firmware is a bring-up stub, and the correct cable is still needed.
+## MicroPython hardware probes
+
+The board is currently on the official MicroPython firmware, with no auto-start
+relay installed. These probes are run from the host, not at power-on:
+
+```sh
+uv run --with mpremote mpremote connect auto run firmware/pico-w/diagnostics/radio_probe.py
+python3 scripts/accept-pico-hr.py --handoff
+```
+
+The second command requires explicit handoff, stops the Mac relay/watchdog for a
+bounded test and restores both in `finally`. Received notifications are queued in
+MicroPython before parsing and durably saved to the Mac telemetry outbox for
+upload. It subscribes to standard HR/RR only and sends no buzzer or alarm commands.
+The tested WHOOP HR service has exactly one trailing CCCD at `HR value + 1`; the
+probe checks that layout before writing. Descriptor discovery on this firmware
+reported the wrong completion event for the singleton range, so this is a
+**device-specific diagnostic**, not a general production GATT client.
+
+## Always-on relay work still required
+
+1. USB, Wi-Fi scanning, BLE scanning and a controlled WHOOP connection are proven
+   with MicroPython. Choose and harden the runtime (fix the C startup or use the
+   MicroPython client), then validate Wi-Fi/BLE coexistence while actually joining
+   the apartment network and uploading. Keep explicit ownership handoff/fallback.
+2. Port framing/CRC, characteristic reassembly, raw telemetry preservation,
+   buffered-history ACKs, reconnect/backoff and clock verification. Forward
+   batches over verified TLS to a device-authenticated ingest endpoint. Do not
+   put the Supabase service-role key on the Pico. Advance the strap trim cursor
+   only after the corresponding readings are durably stored by the ingest path.
+3. Provision apartment Wi-Fi, persist credentials/bond keys and cached alarms,
+   and implement bounded buffering, flash-wear management, watchdog/power-cycle
+   recovery, and device status/lease ownership. The Pico's 2 MiB flash is not an
+   unlimited telemetry archive; use the strap's unacknowledged history as the
+   principal retry source when the network is unavailable.
+4. Match the Mac's alarm functionality: several schedules, dashboard toggles,
+   immediate edits/resync, native alarm readback, timezone/DST-correct future UTC
+   occurrences and advancing to the next alarm without a Mac. Move analysis
+   execution from the Mac-only SQLite worker to a hosted worker so insights also
+   continue with the Mac powered off.
+
+Final acceptance must use wall power with the Mac relay stopped: live/rich upload,
+leave-and-return backfill with actual interval coverage, two physical sequential
+alarms, edits/toggles, Wi-Fi outage recovery and a cold power cycle. Do not label
+the Pico the active relay until this entire path passes. The mobile layout stays
+unchanged.
