@@ -83,6 +83,9 @@ const STUDIO_ORIGIN =
     /\/$/,
     "",
   ) ?? "";
+const USE_REST_LIVE =
+  (import.meta.env.VITE_LIVE_TRANSPORT as string | undefined) === "rest" ||
+  Boolean(STUDIO_ORIGIN);
 
 function resolveApiUrl(path: string): string {
   if (!path.startsWith("/") || !STUDIO_ORIGIN) return path;
@@ -381,6 +384,7 @@ export default function App() {
   const [sessionState, setSessionState] = useState<SessionStateMsg | null>(null);
   const [lastLagMs, setLastLagMs] = useState<number | null>(null);
   const [lastHr, setLastHr] = useState<HeartRateMsg | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [pulseSeries, setPulseSeries] = useState<HrPoint[]>([]);
   const [lastBattery, setLastBattery] = useState<{
     percent: number | null;
@@ -450,6 +454,8 @@ export default function App() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const hrQueueRef = useRef<HrPoint[]>([]);
+  const lastPolledHrMsRef = useRef<number | null>(null);
+  const livePollInFlightRef = useRef(false);
   const drainRafRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -588,6 +594,43 @@ export default function App() {
     }
   }, []);
 
+  // T3: REST-polling live BPM for the Pulse tab (Milestone 1 transport decision).
+  const refreshLiveBpm = useCallback(async () => {
+    if (livePollInFlightRef.current) return;
+    livePollInFlightRef.current = true;
+    try {
+      const since = lastPolledHrMsRef.current;
+      const query = since == null ? "range=1h&limit=120" : `since_ms=${since}&limit=120`;
+      const j = (await api(
+        `/api/insights/heart-rate-series?${query}`,
+      )) as { points?: HrPoint[] };
+      const pts = (Array.isArray(j.points) ? j.points : [])
+        .filter((p) => Number.isFinite(p.t_ms) && Number.isFinite(p.bpm))
+        .filter((p) => since == null || p.t_ms > since)
+        .sort((a, b) => a.t_ms - b.t_ms);
+      if (pts.length > 0) {
+        const last = pts[pts.length - 1]!;
+        lastPolledHrMsRef.current = last.t_ms;
+        setLastHr({
+          type: "heart_rate",
+          unix_ms: last.t_ms,
+          bpm: last.bpm,
+          time_local: new Date(last.t_ms).toLocaleString(),
+          rr_count: 0,
+          received_at_ms: Date.now(),
+        });
+        hrQueueRef.current.push(...pts);
+        schedulePulseDrain();
+      }
+      setWsState("open");
+    } catch (error) {
+      setWsState("closed");
+      throw error;
+    } finally {
+      livePollInFlightRef.current = false;
+    }
+  }, [schedulePulseDrain]);
+
   useEffect(() => {
     if (tab !== "trends") return;
     void loadHeartSeries(hrRange);
@@ -603,7 +646,23 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [tab, autoRefreshInsights, refreshInsights, loadHeartSeries, hrRange]);
 
+  // T3: poll live BPM from the REST backend while the Pulse tab is mounted.
   useEffect(() => {
+    if (tab !== "pulse" || !USE_REST_LIVE) return;
+    void refreshLiveBpm().catch(() => {});
+    const id = window.setInterval(() => {
+      void refreshLiveBpm().catch(() => {});
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [tab, refreshLiveBpm]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (USE_REST_LIVE) return;
     let cancelled = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     let attempt = 0;
@@ -766,10 +825,12 @@ export default function App() {
 
   const lastReceivedAgeMs =
     lastHr?.received_at_ms != null
-      ? Date.now() - lastHr.received_at_ms
+      ? nowMs - lastHr.received_at_ms
       : null;
+  const sampleAgeMs = lastHr != null ? nowMs - lastHr.unix_ms : null;
   const streamSampleRecent =
-    lastReceivedAgeMs != null && lastReceivedAgeMs < LIVE_SAMPLE_MAX_AGE_MS;
+    lastReceivedAgeMs != null && lastReceivedAgeMs < LIVE_SAMPLE_MAX_AGE_MS &&
+    sampleAgeMs != null && sampleAgeMs >= -5_000 && sampleAgeMs < LIVE_SAMPLE_MAX_AGE_MS;
   const lagBasedSyncing =
     lastLagMs != null
       ? lastLagMs > SYNCING_LAG_MS
@@ -779,7 +840,9 @@ export default function App() {
       ? wsLabel(wsState)
       : lagBasedSyncing
         ? "Syncing"
-        : "Live";
+        : streamSampleRecent
+          ? "Live"
+          : "Stale";
   const showLivePill =
     lastHr != null &&
     !lagBasedSyncing &&

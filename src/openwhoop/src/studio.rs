@@ -165,7 +165,10 @@ async fn insights_vitals(State(app): State<AppState>) -> Result<Json<Value>, (St
 #[derive(Deserialize)]
 struct HeartSeriesQuery {
     /// One of `1h`, `24h`, `7d`.
-    range: String,
+    range: Option<String>,
+    /// Return samples strictly newer than this Unix millisecond timestamp.
+    since_ms: Option<i64>,
+    limit: Option<u64>,
 }
 
 fn heart_series_hours(range: &str) -> Option<i64> {
@@ -185,18 +188,28 @@ async fn insights_heart_rate_series(
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available - run with DATABASE_URL or connect to AWS".into(),
     ))?;
-    let hours = heart_series_hours(&q.range).ok_or((
+    let range = q.range.as_deref().unwrap_or("1h");
+    let hours = heart_series_hours(range).ok_or((
         StatusCode::BAD_REQUEST,
         "Invalid range. Use 1h, 24h, or 7d.".to_string(),
     ))?;
-    let from = Local::now().naive_local() - ChDuration::hours(hours);
-    let rows = heart_rate::Entity::find()
-        .filter(heart_rate::Column::Time.gte(from))
-        .order_by_asc(heart_rate::Column::Time)
-        .limit(50_000)
+    let from = q.since_ms
+        .and_then(|ms| Local.timestamp_millis_opt(ms).single())
+        .map(|dt| dt.naive_local())
+        .unwrap_or_else(|| Local::now().naive_local() - ChDuration::hours(hours));
+    let limit = q.limit.unwrap_or(2_500).clamp(1, 2_500);
+    let mut rows = heart_rate::Entity::find()
+        .filter(if q.since_ms.is_some() {
+            heart_rate::Column::Time.gt(from)
+        } else {
+            heart_rate::Column::Time.gte(from)
+        })
+        .order_by_desc(heart_rate::Column::Time)
+        .limit(limit)
         .all(db.connection())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    rows.reverse();
 
     // `heart_rate.time` is stored as local wall clock (see `timestamp_to_local` on ingest).
     // Do not use `naive.and_utc()` — that treats civil time as UTC and shifts the axis.
@@ -217,7 +230,7 @@ async fn insights_heart_rate_series(
         .collect();
 
     Ok(Json(json!({
-        "range": q.range,
+        "range": range,
         "count": points.len(),
         "points": points,
     })))
