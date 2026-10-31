@@ -115,6 +115,7 @@ impl WhoopDevice {
     const LAG_THRESHOLD_MS: i64 = 15_000;
     const LIVE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
     const QUIET_HISTORY_NUDGE: Duration = Duration::from_secs(10);
+    const NOTIFICATION_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub fn new(
         peripheral: Peripheral,
@@ -350,6 +351,7 @@ impl WhoopDevice {
         history_sync: bool,
     ) -> anyhow::Result<()> {
         let mut notifications = self.peripheral.notifications().await?;
+        self.last_notification_at = Some(Instant::now());
 
         self.emit_session_state(tracker, SessionState::Syncing, "notifications_ready");
         if history_sync {
@@ -361,19 +363,21 @@ impl WhoopDevice {
         }
 
         let mut rx_count: u64 = 0;
+        let mut health_tick = tokio::time::interval(Self::LIVE_PROBE_INTERVAL);
+        health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         'a: loop {
             if should_exit.load(Ordering::SeqCst) {
                 break;
             }
             let notification = notifications.next();
-            let sleep_ = sleep(Self::LIVE_PROBE_INTERVAL);
 
             tokio::select! {
                 biased;
                 // Control jobs must not starve behind a large historical-data burst.
                 Some(job) = jobs.recv() => {
-                    self.handle_studio_job(job).await?;
+                    timeout(Duration::from_secs(5), self.handle_studio_job(job))
+                        .await.map_err(|_| anyhow!("BLE control operation stalled"))??;
                 }
                 Some(notification) = notification => {
                     self.last_notification_at = Some(Instant::now());
@@ -424,15 +428,28 @@ impl WhoopDevice {
                         tracker.live_probe_streak = 0;
                     }
                 }
-                _ = sleep_ => {
+                _ = health_tick.tick() => {
                     self.emit_connection_health(0, scan_cycle);
-                    if self.on_sleep().await? {
-                        error!("Whoop disconnected");
-                        self.emit_session_state(tracker, SessionState::Reconnecting, "ble_disconnected");
+                    let disconnected = timeout(Duration::from_secs(5), self.on_sleep()).await??;
+                    let notifications_stale = self.last_notification_at
+                        .is_some_and(|at| at.elapsed() >= Self::NOTIFICATION_STALE_TIMEOUT);
+                    if disconnected || notifications_stale {
+                        if notifications_stale {
+                            error!("Whoop BLE notifications stale; forcing reconnection");
+                            self.emit_session_state(tracker, SessionState::Reconnecting, "ble_notifications_stale");
+                            let _ = timeout(Duration::from_secs(5), self.peripheral.disconnect()).await;
+                            sleep(Duration::from_secs(1)).await;
+                        } else {
+                            error!("Whoop disconnected");
+                            self.emit_session_state(tracker, SessionState::Reconnecting, "ble_disconnected");
+                        }
                         for attempt in 1..=3 {
                             self.emit_connection_health(attempt, scan_cycle);
-                            if self.connect().await.is_ok() {
-                                self.initialize().await?;
+                            if matches!(timeout(Duration::from_secs(10), self.connect()).await, Ok(Ok(()))) {
+                                self.studio_pending = None;
+                                timeout(Duration::from_secs(15), self.initialize()).await??;
+                                notifications = self.peripheral.notifications().await?;
+                                self.last_notification_at = Some(Instant::now());
                                 self.emit_session_state(tracker, SessionState::Syncing, "reconnected");
                                 if history_sync {
                                     self.send_command(WhoopPacket::history_start()).await?;
@@ -582,7 +599,9 @@ impl WhoopDevice {
                         }
                     }
                 }
-                let gatt_percent = self.read_ble_battery_level().await;
+                let gatt_percent = timeout(Duration::from_secs(2), self.read_ble_battery_level())
+                    .await
+                    .unwrap_or(None);
                 self.studio_pending = Some(StudioPending::Battery {
                     reply,
                     gatt_percent,

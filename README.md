@@ -83,6 +83,8 @@ For local operation, build the binary and use an ignored `.env.cloud` containing
 
 On the configured Mac, `scripts/install-mac-relay.sh` installs a per-user LaunchAgent that restarts the relay after login and prevents idle sleep while it runs. It uses `~/.local/share/openwhoop/relay.sqlite` and keeps `.env.cloud` local. Closing a laptop lid can still suspend Bluetooth and prevent the Mac from advancing a sequence.
 
+The installer also registers `com.openwhoop.watchdog`, which checks saved heart-rate progress every 30 seconds and restarts the relay after 90 seconds without progress. The BLE loop reconnects after 30 seconds without notifications, with bounded battery and control operations. Recovery may leave a gap in live samples; bulk historical import remains a separate operation.
+
 The Mac LaunchAgent sets `OPENWHOOP_HISTORY_SYNC=false` to prioritize alarm readback and live GATT heart rate over bulk history downloads. `live-server` otherwise keeps automatic history sync enabled. Use `download-history` separately when you want buffered readings imported; it may compete with alarm controls while it runs.
 
 When Supabase is configured, the Mac schedules only alarms synced from the hosted dashboard. Older schedules in its local SQLite database remain stored but cannot trigger an unseen alarm. A standalone `live-server` without Supabase continues to use local schedules.
