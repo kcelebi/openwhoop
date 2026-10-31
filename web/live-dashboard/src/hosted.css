@@ -7,6 +7,10 @@
 .hosted button:disabled{opacity:.5;cursor:default}
 .hosted-header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:10px 0 26px}
 .header-right{display:flex;align-items:flex-end;flex-direction:column;gap:5px}
+.header-status{display:flex;align-items:center;gap:12px}
+.battery-state{display:inline-flex;align-items:center;gap:6px;color:#bdd1c3;font-size:.85rem;white-space:nowrap}
+.battery-icon{position:relative;width:19px;height:10px;border:1.5px solid currentColor;border-radius:3px}
+.battery-icon:after{content:"";position:absolute;right:-4px;top:2px;width:2px;height:4px;background:currentColor;border-radius:0 2px 2px 0}
 .hosted button.text-button{border:0;background:transparent;color:#a6b8ae;padding:2px 4px;min-height:24px;font-size:.8rem}
 .relay-state{display:flex;align-items:center;gap:7px;color:#bdd1c3;font-size:.85rem;white-space:nowrap}
 .led{width:8px;height:8px;border-radius:50%;background:#9c6b55}
@@ -20,15 +24,21 @@
 .bpm span{font-size:1rem;letter-spacing:0;color:#a6b8ae}
 .chart{height:270px;margin-top:14px}
 .alarm-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:14px 0 16px}
-.alarm-heading p{margin:5px 0 0;font-size:.83rem}
+.alarm-heading p{margin:0;font-size:.83rem}
 .hosted button.add-alarm,.hosted .editor-actions button:first-child{background:#42ae70;border-color:#42ae70;color:#082011;font-weight:700}
-.alarm-editor{display:grid;gap:15px}
+.alarm-editor{display:grid;gap:15px;min-width:0}
 .editor-title{display:flex;justify-content:space-between;align-items:center}
 .hosted label{font-size:.84rem;color:#bdd1c3}
+.alarm-editor label{display:block;min-width:0}
 .hosted input:not([type=checkbox]){display:block;width:100%;margin-top:6px;background:#0d1b14;color:#fff;border:1px solid #42604d;border-radius:11px;min-height:48px;padding:8px 12px;font:inherit}
-.hosted input[type=time]{font-size:1.8rem;letter-spacing:.02em}
-.repeat-title{display:flex;justify-content:space-between;font-size:.84rem;color:#bdd1c3}
-.repeat-title span{color:#8fbba1}
+.hosted input[type=time]{min-width:0;max-width:100%;font-size:clamp(1.2rem,6vw,1.8rem);letter-spacing:.02em;overflow:hidden}
+.repeat-settings{border-top:1px solid #294637;padding-top:4px}
+.repeat-settings summary,.alarm-tools summary{cursor:pointer;list-style:none;color:#bdd1c3;font-size:.88rem;min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.repeat-settings summary::-webkit-details-marker,.alarm-tools summary::-webkit-details-marker{display:none}
+.repeat-settings summary:after,.alarm-tools summary:after{content:"›";font-size:1.3rem;color:#8fbba1}
+.repeat-settings[open] summary:after,.alarm-tools[open] summary:after{transform:rotate(90deg)}
+.repeat-settings summary span{margin-left:auto;color:#8fbba1}
+.repeat-settings .days{margin:12px 0 18px}
 .days{display:grid;grid-template-columns:repeat(7,1fr);gap:7px}
 .days button{padding:0;min-height:43px;border-radius:50%;font-size:.77rem;background:#0e1b15}
 .days button.selected{background:#42ae70;color:#082011;border-color:#42ae70;font-weight:700}
@@ -51,6 +61,7 @@
 .empty-alarms{padding:35px 20px;border:1px dashed #42604d;border-radius:16px;text-align:center;color:#a6b8ae}
 .resync-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0}
 .resync-row small{text-align:right}
+.alarm-tools{border-top:1px solid #294637;margin-top:12px}
 .haptic-tools{border-top:1px solid #294637;padding-top:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .haptic-tools small{width:100%}
 .message{position:sticky;bottom:12px;background:#1c3326;padding:12px;border-radius:12px}
@@ -64,6 +75,9 @@
   .alarm-time{font-size:1.9rem}
   .days{gap:4px}
   .days button{min-height:40px;font-size:.7rem}
+  .hosted-header{gap:8px}
+  .header-status{gap:8px}
+  .relay-state,.battery-state{font-size:.75rem}
   .resync-row{align-items:start;flex-direction:column}
   .resync-row small{text-align:left}
 }
