@@ -33,7 +33,7 @@ jobs:
           command: check
           args: --all-targets
       - name: Capture and outbox tests
-        run: cargo test -p openwhoop-db -p openwhoop
+        run: cargo test -p openwhoop-codec -p openwhoop-db -p openwhoop
   dashboard:
     name: Dashboard
     runs-on: ubuntu-latest

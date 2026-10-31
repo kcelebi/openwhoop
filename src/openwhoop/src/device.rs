@@ -253,6 +253,12 @@ impl WhoopDevice {
         Ok(is_connected)
     }
 
+    pub async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.studio_pending = None;
+        self.peripheral.disconnect().await?;
+        Ok(())
+    }
+
     fn create_char(characteristic: Uuid) -> Characteristic {
         Characteristic {
             uuid: characteristic,
@@ -421,6 +427,13 @@ impl WhoopDevice {
                 biased;
                 // Control jobs must not starve behind a large historical-data burst.
                 Some(job) = jobs.recv() => {
+                    if rich_capture && !history_sync && history_in_flight {
+                        // Abort only the radio transfer, not the persisted data.
+                        // Unacknowledged batches replay safely on the next window.
+                        let _ = timeout(Duration::from_secs(2), self.send_command(WhoopPacket::abort_history())).await;
+                        history_in_flight = false;
+                        info!("Rich telemetry paused for device control");
+                    }
                     timeout(Duration::from_secs(5), self.handle_studio_job(job))
                         .await.map_err(|_| anyhow!("BLE control operation stalled"))??;
                 }
