@@ -40,6 +40,42 @@ fn standard_heart_rate_bpm(bytes: &[u8]) -> Option<u8> {
     (raw > 0 && raw <= 250).then_some(raw as u8)
 }
 
+fn standard_heart_rate_fields(bytes: &[u8]) -> Option<(u8, Vec<u16>, serde_json::Value)> {
+    let bpm = standard_heart_rate_bpm(bytes)?;
+    let flags = bytes[0];
+    let mut offset = if flags & 1 == 0 { 2 } else { 3 };
+    let energy = if flags & 8 != 0 {
+        let value = bytes
+            .get(offset..offset + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]));
+        offset += 2;
+        value
+    } else {
+        None
+    };
+    let ticks: Vec<u16> = if flags & 16 != 0 {
+        bytes
+            .get(offset..)
+            .unwrap_or_default()
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let rr = ticks
+        .iter()
+        .map(|ticks| ((u32::from(*ticks) * 1000 + 512) / 1024) as u16)
+        .collect();
+    Some((
+        bpm,
+        rr,
+        json!({"flags": flags, "contact_supported": flags & 4 != 0,
+        "skin_contact": if flags & 4 != 0 { Some(flags & 2 != 0) } else { None },
+        "energy_expended_kj": energy, "rr_ticks_1024": ticks}),
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionState {
     Searching,
@@ -317,6 +353,7 @@ impl WhoopDevice {
                 },
                 Some(notification) = notification => {
                     rx_count += 1;
+                    self.whoop.capture_raw_notification(&notification).await?;
                     let len = notification.value.len();
                     if rx_count <= 8 || rx_count % 200 == 0 {
                         info!(
@@ -365,6 +402,14 @@ impl WhoopDevice {
         let mut rx_count: u64 = 0;
         let mut health_tick = tokio::time::interval(Self::LIVE_PROBE_INTERVAL);
         health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let rich_capture = std::env::var("OPENWHOOP_RICH_CAPTURE").is_ok_and(|v| v == "true");
+        let mut rich_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(20),
+            Duration::from_secs(180),
+        );
+        rich_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut history_in_flight = history_sync;
+        let mut history_last_rx: Option<Instant> = None;
 
         'a: loop {
             if should_exit.load(Ordering::SeqCst) {
@@ -381,16 +426,18 @@ impl WhoopDevice {
                 }
                 Some(notification) = notification => {
                     self.last_notification_at = Some(Instant::now());
+                    if notification.uuid == DATA_FROM_STRAP { history_last_rx = Some(Instant::now()); }
+                    self.whoop.capture_raw_notification(&notification).await?;
                     rx_count += 1;
                     if notification.uuid == HEART_RATE_MEASUREMENT {
-                        if let Some(bpm) = standard_heart_rate_bpm(&notification.value) {
+                        if let Some((bpm, rr, fields)) = standard_heart_rate_fields(&notification.value) {
                             self.whoop.record_live_heart_rate(HistoryReading {
                                 unix: u64::try_from(Utc::now().timestamp_millis())?,
                                 bpm,
-                                rr: Vec::new(),
+                                rr,
                                 imu_data: Vec::new(),
                                 sensor_data: None,
-                            }).await?;
+                            }, fields).await?;
                             self.emit_session_state(tracker, SessionState::Live, "standard_hr_measurement");
                         }
                         continue;
@@ -417,7 +464,9 @@ impl WhoopDevice {
                     if let Some(packet) = self.whoop.handle_packet(packet).await? {
                         self.send_command(packet).await?;
                     }
-                    if self.whoop.take_history_refresh_requested() && history_sync {
+                    let history_complete = self.whoop.take_history_refresh_requested();
+                    if history_complete { history_in_flight = false; }
+                    if history_complete && history_sync {
                         info!("HistoryComplete: issuing history_start for incremental window");
                         self.send_command(WhoopPacket::history_start()).await?;
                         self.emit_session_state(
@@ -426,6 +475,27 @@ impl WhoopDevice {
                             "history_complete_refresh",
                         );
                         tracker.live_probe_streak = 0;
+                        history_in_flight = true;
+                    }
+                }
+                _ = rich_tick.tick(), if rich_capture && !history_sync => {
+                    // Recover buffered sensor fields without repeatedly starting
+                    // bulk transfers or competing with imminent alarm programming.
+                    // Some firmware ends a window with HistoryEnd but never
+                    // emits HistoryComplete. A quiet historical channel must
+                    // not disable sensor collection forever while GATT HR runs.
+                    if history_in_flight && history_last_rx.is_some_and(|t| t.elapsed() > Duration::from_secs(30)) {
+                        history_in_flight = false;
+                    }
+                    if !history_in_flight && self.studio_pending.is_none() {
+                        let now = Utc::now().timestamp();
+                        let next = self.whoop.database.next_enabled_alarm_unix(now, false).await?;
+                        if next.is_none_or(|unix| unix - now > 120) {
+                            match timeout(Duration::from_secs(3), self.send_command(WhoopPacket::history_start())).await {
+                                Ok(Ok(())) => { history_in_flight = true; history_last_rx = Some(Instant::now()); info!("Rich telemetry: requested buffered sensor readings"); }
+                                _ => warn!("Rich telemetry request deferred after BLE timeout"),
+                            }
+                        }
                     }
                 }
                 _ = health_tick.tick() => {
@@ -450,6 +520,7 @@ impl WhoopDevice {
                                 timeout(Duration::from_secs(15), self.initialize()).await??;
                                 notifications = self.peripheral.notifications().await?;
                                 self.last_notification_at = Some(Instant::now());
+                                history_in_flight = history_sync;
                                 self.emit_session_state(tracker, SessionState::Syncing, "reconnected");
                                 if history_sync {
                                     self.send_command(WhoopPacket::history_start()).await?;
@@ -800,4 +871,16 @@ mod tests {
         assert_eq!(state, SessionState::CatchingUp);
         assert_eq!(streak, 0);
     }
+}
+#[test]
+fn gatt_preserves_rr_contact_and_energy_without_synthesizing_rr() {
+    let (bpm, rr, fields) = standard_heart_rate_fields(&[0x1e, 60, 9, 0, 0, 4, 0, 2]).unwrap();
+    assert_eq!(bpm, 60);
+    assert_eq!(rr, vec![1000, 500]);
+    assert_eq!(fields["rr_ticks_1024"], serde_json::json!([1024, 512]));
+    assert_eq!(fields["energy_expended_kj"], 9);
+    assert_eq!(fields["skin_contact"], true);
+    let (_, rr, fields) = standard_heart_rate_fields(&[0, 60]).unwrap();
+    assert!(rr.is_empty());
+    assert!(fields["skin_contact"].is_null());
 }

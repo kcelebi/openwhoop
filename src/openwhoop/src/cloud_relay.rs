@@ -215,6 +215,59 @@ async fn upload_hr(db: &DatabaseHandler, cfg: &CloudConfig, client: &Client) -> 
     Ok(())
 }
 
+async fn upload_telemetry(
+    db: &DatabaseHandler,
+    cfg: &CloudConfig,
+    client: &Client,
+) -> anyhow::Result<()> {
+    let rows = db.pending_telemetry(150).await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let payload: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({"owner_id": cfg.owner_id,
+        "id": r.id, "kind": r.kind, "recorded_at_ms": r.recorded_at_ms,
+        "received_at_ms": r.received_at_ms, "payload": r.payload})
+        })
+        .collect();
+    checked(
+        cfg.request(
+            client,
+            Method::POST,
+            cfg.rest_url("whoop_telemetry", "on_conflict=owner_id%2Cid"),
+        )
+        .header("Prefer", "resolution=merge-duplicates,return=minimal")
+        .json(&payload)
+        .send()
+        .await?,
+    )
+    .await?;
+    let historical: Vec<Value> = rows.iter().filter(|r| r.kind == "reading" && r.payload.get("source").and_then(Value::as_str) != Some("gatt_live"))
+        .filter_map(|r| {
+            let unix = r.recorded_at_ms?;
+            let bpm = r.payload.get("bpm")?.as_i64()?;
+            if !(20..=250).contains(&bpm) || unix < 946684800000 || unix > Utc::now().timestamp_millis() + 300000 { return None; }
+            Some(json!({"owner_id":cfg.owner_id,"recorded_at_ms":unix,"received_at_ms":r.received_at_ms,"bpm":bpm,"source":r.payload.get("source")}))
+        }).collect();
+    if !historical.is_empty() {
+        checked(
+            cfg.request(
+                client,
+                Method::POST,
+                cfg.rest_url("whoop_hr_samples", "on_conflict=owner_id%2Crecorded_at_ms"),
+            )
+            .header("Prefer", "resolution=ignore-duplicates,return=minimal")
+            .json(&historical)
+            .send()
+            .await?,
+        )
+        .await?;
+    }
+    db.acknowledge_telemetry(&rows).await
+}
+
 async fn complete_command(
     cfg: &CloudConfig,
     client: &Client,
@@ -434,6 +487,21 @@ pub async fn run(
         exit.clone(),
     ));
     let mut last_heartbeat = 0;
+    let telemetry_db = db.clone();
+    let telemetry_cfg = cfg.clone();
+    let telemetry_client = client.clone();
+    let telemetry_exit = exit.clone();
+    let telemetry_task = tokio::spawn(async move {
+        while !telemetry_exit.load(Ordering::SeqCst) {
+            if let Err(error) =
+                upload_telemetry(&telemetry_db, &telemetry_cfg, &telemetry_client).await
+            {
+                log::warn!("cloud rich telemetry upload pending: {error}");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
     while !exit.load(Ordering::SeqCst) {
         tick.tick().await;
         if let Err(error) = upload_hr(&db, &cfg, &client).await {
@@ -457,4 +525,5 @@ pub async fn run(
         }
     }
     battery_task.abort();
+    telemetry_task.abort();
 }

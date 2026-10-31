@@ -1,0 +1,31 @@
+@media(min-width:901px){
+ .hosted.desktop-history{max-width:1100px}
+ .hosted.desktop-history>.hero{display:grid;grid-template-columns:1fr auto;align-items:center;gap:0 20px;padding:20px 24px}
+ .hosted.desktop-history>.hero>small{grid-column:1}
+ .hosted.desktop-history>.hero>.bpm{grid-column:2;grid-row:1 / span 2;font-size:6rem;margin:0}
+ .hosted.desktop-history>.hero>p{grid-column:1;grid-row:2;margin:8px 0 0}
+ .desktop-pulse .history-heading,.desktop-pulse .history-navigation,.desktop-pulse .insight-heading{display:flex;justify-content:space-between;align-items:center;gap:14px}
+ .desktop-pulse .history-heading{margin-bottom:16px}
+ .desktop-pulse .history-ranges{display:flex;gap:5px}
+ .hosted .desktop-pulse button{background:transparent;min-height:36px;padding:6px 12px;font-size:.85rem}
+ .hosted .desktop-pulse button[aria-pressed=true]{background:#203e2c;border-color:#67e8a0;color:#8ef0b5}
+ .desktop-pulse .history-navigation{margin-bottom:14px}
+ .desktop-pulse .history-navigation>div{display:flex;gap:5px}
+ .desktop-pulse .history-navigation small{flex:1;text-align:center}
+ .desktop-pulse .history-dates{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+ .desktop-pulse .history-dates label{min-width:0}
+ .desktop-pulse .history-dates input{min-width:0;max-width:100%}
+ .desktop-pulse .history-chart{height:310px}
+ .desktop-pulse .history-summary{display:flex;align-items:center;gap:22px;margin:18px 0 10px;font-size:.87rem}
+ .desktop-pulse .history-summary strong{color:#edf5f1;font-weight:500}
+ .desktop-pulse .history-availability{font-size:.72rem;opacity:.8}
+ .desktop-pulse .desktop-insights{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+ .desktop-pulse .insight-card{margin-bottom:0}
+ .desktop-pulse .insight-heading small{font-size:.75rem}
+ .desktop-pulse .insight-value{font-size:2.1rem;letter-spacing:-.03em;margin-top:22px}
+ .desktop-pulse .insight-value small{font-size:.8rem;letter-spacing:0}
+ .desktop-pulse .insight-card p{font-size:.83rem;line-height:1.5}
+ .desktop-pulse .muted{color:#7e9688}
+ .desktop-pulse details{border-top:1px solid #294637;margin-top:18px;padding-top:10px}
+ .desktop-pulse summary{cursor:pointer;color:#9fb8aa;font-size:.8rem;min-height:28px}
+}

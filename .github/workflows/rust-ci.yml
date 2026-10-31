@@ -11,8 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Relay watchdog tests
-        run: python3 -m unittest discover -s scripts -p test_relay_watchdog.py
+      - name: Relay watchdog and telemetry analysis tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Setup build dependencies
         run: |
           sudo apt update
@@ -32,3 +32,25 @@ jobs:
         with:
           command: check
           args: --all-targets
+      - name: Capture and outbox tests
+        run: cargo test -p openwhoop-db -p openwhoop
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/live-dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/live-dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+        env:
+          GITHUB_PAGES: "true"
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:hosted

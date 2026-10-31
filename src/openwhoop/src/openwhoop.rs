@@ -36,7 +36,32 @@ pub struct OpenWhoop {
 }
 
 impl OpenWhoop {
-    pub async fn record_live_heart_rate(&mut self, reading: HistoryReading) -> anyhow::Result<()> {
+    pub async fn capture_raw_notification(
+        &self,
+        notification: &ValueNotification,
+    ) -> anyhow::Result<()> {
+        self.database.enqueue_telemetry(uuid::Uuid::new_v4().to_string(), "raw_ble", None,
+            serde_json::json!({"characteristic": notification.uuid.to_string(), "bytes": notification.value, "decoder_version": 1})).await
+    }
+
+    async fn capture_reading(
+        &self,
+        source: &str,
+        reading: &HistoryReading,
+        extra: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let unix = i64::try_from(reading.unix)?;
+        self.database.enqueue_telemetry(format!("{source}:{unix}"), "reading", Some(unix),
+            serde_json::json!({"source": source, "bpm": reading.bpm, "rr_ms": reading.rr,
+                "imu_data": reading.imu_data, "sensor_data": reading.sensor_data, "gatt": extra, "decoder_version": 1})).await
+    }
+
+    pub async fn record_live_heart_rate(
+        &mut self,
+        reading: HistoryReading,
+        fields: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.capture_reading("gatt_live", &reading, fields).await?;
         let received_at_ms = Utc::now().timestamp_millis();
         let time_local = DateTime::from_timestamp_millis(i64::try_from(reading.unix)?)
             .ok_or_else(|| anyhow::anyhow!("invalid live heart-rate timestamp"))?
@@ -224,7 +249,12 @@ impl OpenWhoop {
 
     async fn handle_data(&mut self, data: WhoopData) -> anyhow::Result<Option<WhoopPacket>> {
         match data {
-            WhoopData::HistoryReading(hr) if hr.is_valid() => {
+            WhoopData::HistoryReading(hr) => {
+                self.capture_reading("device_history", &hr, serde_json::Value::Null)
+                    .await?;
+                if !hr.is_valid() {
+                    return Ok(None);
+                }
                 let ptime = DateTime::from_timestamp_millis(i64::try_from(hr.unix)?)
                     .unwrap()
                     .with_timezone(&Local)
@@ -278,12 +308,6 @@ impl OpenWhoop {
                 }
 
                 self.history_packets.push(hr);
-            }
-            WhoopData::HistoryReading(hr) => {
-                debug!(
-                    "HistoryReading skipped (validation failed) unix_ms={} bpm={}",
-                    hr.unix, hr.bpm
-                );
             }
             WhoopData::HistoryMetadata { data, cmd, .. } => match cmd {
                 MetadataType::HistoryComplete => {

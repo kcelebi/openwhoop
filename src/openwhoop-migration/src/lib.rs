@@ -17,6 +17,7 @@ mod m20260701_000000_command_queue;
 mod m20261031_000000_alarm_timezone_missed;
 mod m20261031_000001_cloud_hr_outbox;
 mod m20261031_000002_alarm_cloud_id;
+mod m20261031_000003_telemetry_outbox;
 
 pub struct Migrator;
 
@@ -41,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261031_000000_alarm_timezone_missed::Migration),
             Box::new(m20261031_000001_cloud_hr_outbox::Migration),
             Box::new(m20261031_000002_alarm_cloud_id::Migration),
+            Box::new(m20261031_000003_telemetry_outbox::Migration),
         ]
     }
 }
