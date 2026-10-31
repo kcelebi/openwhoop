@@ -243,6 +243,7 @@ async fn process_commands(
     cfg: &CloudConfig,
     client: &Client,
     jobs: &mpsc::Sender<StudioDeviceJob>,
+    force_alarm_recheck: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let response = cfg
         .request(
@@ -262,6 +263,11 @@ async fn process_commands(
     for command in commands {
         if command.expires_at <= Utc::now() {
             complete_command(cfg, client, command.id, "expired", None).await?;
+            continue;
+        }
+        if command.kind == "resync_alarm" {
+            force_alarm_recheck.store(true, Ordering::SeqCst);
+            complete_command(cfg, client, command.id, "done", None).await?;
             continue;
         }
         let (reply, result) = oneshot::channel();
@@ -326,6 +332,7 @@ async fn update_heartbeat(
     cfg: &CloudConfig,
     client: &Client,
     last_hr: &Arc<Mutex<Option<String>>>,
+    strap_state: &Arc<Mutex<Option<Option<i64>>>>,
 ) -> anyhow::Result<()> {
     let sample = last_hr.lock().ok().and_then(|guard| guard.clone());
     let sample: Option<Value> = sample.as_deref().and_then(|s| serde_json::from_str(s).ok());
@@ -334,12 +341,15 @@ async fn update_heartbeat(
         .and_then(|v| v.get("unix_ms"))
         .and_then(Value::as_i64);
     let fresh = current_unix_ms.is_some_and(|ms| Utc::now().timestamp_millis() - ms < 45_000);
+    let strap = strap_state.lock().ok().and_then(|state| *state);
     let payload = json!({
         "owner_id": cfg.owner_id,
         "last_seen_at": Utc::now(),
         "connected": fresh,
         "current_bpm": if fresh { sample.as_ref().and_then(|v| v.get("bpm")).and_then(Value::as_i64) } else { None },
         "current_unix_ms": current_unix_ms,
+        "strap_alarm_enabled": strap.map(|unix| unix.is_some()),
+        "strap_alarm_unix": strap.flatten(),
     });
     let response = cfg
         .request(
@@ -361,6 +371,8 @@ pub async fn run(
     jobs: mpsc::Sender<StudioDeviceJob>,
     last_hr: Arc<Mutex<Option<String>>>,
     exit: Arc<AtomicBool>,
+    force_alarm_recheck: Arc<AtomicBool>,
+    strap_state: Arc<Mutex<Option<Option<i64>>>>,
 ) {
     let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
         Ok(client) => client,
@@ -380,12 +392,12 @@ pub async fn run(
         if let Err(error) = sync_alarms(&db, &cfg, &client).await {
             log::warn!("cloud alarm sync pending: {error}");
         }
-        if let Err(error) = process_commands(&cfg, &client, &jobs).await {
+        if let Err(error) = process_commands(&cfg, &client, &jobs, &force_alarm_recheck).await {
             log::warn!("cloud command poll pending: {error}");
         }
         let now = Utc::now().timestamp();
         if now - last_heartbeat >= 10 {
-            if let Err(error) = update_heartbeat(&cfg, &client, &last_hr).await {
+            if let Err(error) = update_heartbeat(&cfg, &client, &last_hr, &strap_state).await {
                 log::warn!("cloud heartbeat pending: {error}");
             } else {
                 last_heartbeat = now;
