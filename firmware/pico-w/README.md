@@ -1,56 +1,74 @@
-# Pico W — OpenWhoop BLE Relay (Phase 1, T1 spike)
+# OpenWhoop Pico W bring-up
 
-Proposed Raspberry Pi Pico W (RP2040 + CYW43439) relay. Current code only initializes CYW43
-and an LED; it has no BLE central, Whoop protocol, Wi-Fi connection, or HTTP forwarding.
-The Mac relay is the active implementation until hardware, cable, and firmware acceptance.
+This folder contains **diagnostic firmware, not the deployed relay**. The Mac
+continues to own the WHOOP connection, alarms, and cloud synchronization.
 
-## T1 spike plan
+## Hardware evidence (2026-10-31)
 
-1. Install toolchain (macOS host):
-   - `brew install cmake picotool libusb`
-   - SDK: clone https://github.com/raspberrypi/pico-sdk into `~/pico-sdk` and export `PICO_SDK_PATH`.
-   - **Toolchain note (working set, verified 2026-10-30):** use the xPack GNU Arm Embedded GCC
-     `arm-none-eabi-gcc` 12.2.1 (e.g. extracted from
-     `xpack-arm-none-eabi-gcc-12.2.1-1.2-darwin-arm64.tar.gz`) and point
-     `PICO_TOOLCHAIN_PATH` at it. The Arm official GCC 15.3 toolchain currently ships a newlib
-     build that the GNU ld in that package cannot process ("Unknown destination type (ARM/Thumb)").
-2. Bring-up: build & flash the stock Wi-Fi/blink example; verify USB serial output.
-3. BLE central: use `pico_cyw43_arch` BLE API to connect to Whoop service
-   `61080001-8d6d-82b8-614a-1c8cb0f8dcc6` and subscribe to notifies
-   (CMD_FROM_STRAP, EVENTS_FROM_STRAP, DATA_FROM_STRAP, MEMFAULT).
-4. Forward: on `HistoryReading` data → JSON → POST to backend ingest webhook (shared secret).
-5. Spike deliverable: Pico W receives HR data → backend writes to Supabase → read path returns BPM.
+- The replacement cable carries USB data: the board enumerates as `RP2 Boot`,
+  mounts `RPI-RP2`, and responds to picotool.
+- RP2040 B2, 2 MiB flash; Pico SDK 2.3.1 and xPack Arm GCC 12.2.1 build both targets.
+- The radio image flashed and its flash contents verified. USB CDC enumerated,
+  but runtime logging/radio initialization has **not** passed acceptance.
+- A separate USB-only probe is built to isolate the USB runtime from CYW43/BTstack.
+  If the running image does not respond to software reboot, hold BOOTSEL while
+  reconnecting the board before flashing this probe.
+- A full flash backup was saved outside the repository before the first flash.
 
-See `docs/phase1-scoping.md` for the full Phase 1 context and milestone breakdown.
-
-## Build / flash
+## Build
 
 ```sh
-cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
+cmake -B firmware/pico-w/build -S firmware/pico-w \
   -DPICO_SDK_PATH=/Users/kayacelebi/pico-sdk \
   -DPICO_TOOLCHAIN_PATH=/Users/kayacelebi/xpack-arm/xpack-arm-none-eabi-gcc-12.2.1-1.2 \
   -DPICO_BOARD=pico_w
-cmake --build build
-picotool uf2 convert build/pico_w.elf /tmp/pico_w.uf2
-picotool load -f /tmp/pico_w.uf2
+cmake --build firmware/pico-w/build -j 6
 ```
 
-## Status
+The SDK generates UF2s directly. USB stdio is enabled, UART stdio disabled, and
+semihosting is not linked. `pico_usb_probe` prints a heartbeat once per second.
+`pico_w` initializes CYW43, scans for Wi-Fi networks without joining, and scans
+Bluetooth advertisements without connecting to or sending commands to the strap.
+It reports aggregate scan counts and WHOOP names, without printing nearby SSIDs.
 
-- [x] T1.1 Toolchain instructions and initial build spike
-- [ ] T1.2 Radio bring-up (flash + verify)
-- [ ] T1.3 BLE central spike (connect to Whoop)
-- [ ] T1.4 Forward to backend (webhook)
-- [ ] T1.5 Spike deliverable
+## Flash and inspect
 
-## T1.3/T1.4 implementation design (spike draft)
+Start with the USB-only image and verify serial output before testing radios:
 
-- BLE central: use C SDK `pico_cyw43_arch` BLE surface toward Whoop service
-  `61080001-8d6d-82b8-614a-1c8cb0f8dcc6`; subscribe to CMD_FROM_STRAP / EVENTS_FROM_STRAP /
-  DATA_FROM_STRAP / MEMFAULT notifies.
-- On `HistoryReading` data → JSON payload → POST to backend ingest webhook (shared secret).
+```sh
+picotool load -v -x firmware/pico-w/build/pico_usb_probe.uf2
+# Read /dev/cu.usbmodem* at 115200; expect repeated USB probe heartbeats.
+# Re-enter BOOTSEL, then:
+picotool load -v -x firmware/pico-w/build/pico_w.uf2
+```
 
-## Acceptance
+`-f` can request software reboot from a responsive SDK USB-stdio image. If it
+fails, use physical BOOTSEL. Do not run concurrent picotool/serial sessions while
+recovering an unresponsive image. A successful flash is not runtime acceptance.
 
-- **A1:** toolchain + radio + BLE central + forward + ingest → BPM returns. Not accepted: the
-  current firmware is a bring-up stub, and the correct cable is still needed.
+## Always-on relay work still required
+
+1. Prove USB, Wi-Fi and BLE radio runtime, then a controlled WHOOP connection and
+   standard HR/RR subscription. Use a deliberate ownership handoff from the Mac;
+   restore the Mac if any acceptance check fails.
+2. Port framing/CRC, characteristic reassembly, raw telemetry preservation,
+   buffered-history ACKs, reconnect/backoff and clock verification. Forward
+   batches over verified TLS to a device-authenticated ingest endpoint. Do not
+   put the Supabase service-role key on the Pico. Advance the strap trim cursor
+   only after the corresponding readings are durably stored by the ingest path.
+3. Provision apartment Wi-Fi, persist credentials/bond keys and cached alarms,
+   and implement bounded buffering, flash-wear management, watchdog/power-cycle
+   recovery, and device status/lease ownership. The Pico's 2 MiB flash is not an
+   unlimited telemetry archive; use the strap's unacknowledged history as the
+   principal retry source when the network is unavailable.
+4. Match the Mac's alarm functionality: several schedules, dashboard toggles,
+   immediate edits/resync, native alarm readback, timezone/DST-correct future UTC
+   occurrences and advancing to the next alarm without a Mac. Move analysis
+   execution from the Mac-only SQLite worker to a hosted worker so insights also
+   continue with the Mac powered off.
+
+Final acceptance must use wall power with the Mac relay stopped: live/rich upload,
+leave-and-return backfill with actual interval coverage, two physical sequential
+alarms, edits/toggles, Wi-Fi outage recovery and a cold power cycle. Do not label
+the Pico the active relay until this entire path passes. The mobile layout stays
+unchanged.
