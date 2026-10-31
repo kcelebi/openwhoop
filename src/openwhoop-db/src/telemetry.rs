@@ -19,7 +19,7 @@ impl DatabaseHandler {
         payload: Value,
     ) -> anyhow::Result<()> {
         self.connection().execute(Statement::from_sql_and_values(self.connection().get_database_backend(),
-            "INSERT INTO telemetry_outbox(id,kind,recorded_at_ms,received_at_ms,payload,synced) VALUES($1,$2,$3,$4,$5,false) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,synced=false WHERE telemetry_outbox.payload != excluded.payload",
+            "INSERT INTO telemetry_outbox(id,kind,recorded_at_ms,received_at_ms,payload,synced) VALUES($1,$2,$3,$4,$5,false) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,received_at_ms=excluded.received_at_ms,synced=false WHERE telemetry_outbox.payload != excluded.payload",
             [id.into(),kind.into(),recorded_at_ms.into(),chrono::Utc::now().timestamp_millis().into(),payload.to_string().into()])).await?;
         Ok(())
     }
@@ -72,6 +72,13 @@ mod tests {
         db.enqueue_telemetry("reading:1".into(), "reading", Some(1), json!({"bpm":60}))
             .await
             .unwrap();
+        db.connection()
+            .execute(Statement::from_string(
+                db.connection().get_database_backend(),
+                "UPDATE telemetry_outbox SET received_at_ms=1 WHERE id='reading:1'".to_owned(),
+            ))
+            .await
+            .unwrap();
         let previous = db.pending_telemetry(100).await.unwrap();
         assert_eq!(
             previous.iter().find(|r| r.id == "raw").unwrap().payload["bytes"],
@@ -88,6 +95,8 @@ mod tests {
         db.acknowledge_telemetry(&previous).await.unwrap();
         let pending = db.pending_telemetry(100).await.unwrap();
         assert_eq!(pending.len(), 1);
+        // Historical revisions must be visible to the analysis receipt watermark.
+        assert!(pending[0].received_at_ms > 1);
         assert_eq!(pending[0].payload["rr_ms"], json!([1000]));
         db.acknowledge_telemetry(&pending).await.unwrap();
         assert!(db.pending_telemetry(100).await.unwrap().is_empty());

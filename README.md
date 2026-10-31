@@ -87,11 +87,11 @@ On the configured Mac, `scripts/install-mac-relay.sh` installs a per-user Launch
 
 The installer also registers `com.openwhoop.watchdog`, which checks saved heart-rate progress every 30 seconds and restarts the relay after 90 seconds without progress. The BLE loop reconnects after 30 seconds without notifications, with bounded battery and control operations. Recovery may leave a gap in live samples; bulk historical import remains a separate operation.
 
-The Mac LaunchAgent sets `OPENWHOOP_HISTORY_SYNC=false` to disable continuous bulk history catch-up. `OPENWHOOP_RICH_CAPTURE=true` instead requests buffered sensor windows periodically, with control-job priority and an alarm deadline guard. A standalone `live-server` otherwise keeps continuous history sync enabled. `download-history` remains available for a dedicated import session.
+The Mac LaunchAgent sets `OPENWHOOP_HISTORY_SYNC=false` to disable continuous bulk history catch-up. `OPENWHOOP_RICH_CAPTURE=true` instead requests buffered sensor windows periodically, with control-job priority and an alarm deadline guard. An interrupted unfinished archive resumes after a short control-settling delay rather than waiting another three minutes. A standalone `live-server` otherwise keeps continuous history sync enabled. `download-history` remains available for a dedicated import session.
 
 When Supabase is configured, the Mac schedules only alarms synced from the hosted dashboard. Older schedules in its local SQLite database remain stored but cannot trigger an unseen alarm. A standalone `live-server` without Supabase continues to use local schedules.
 
-The Pico W folder is an unflashed radio bring-up stub. It does not connect to the Whoop, decode heart rate, or forward data; it remains deferred until the correct cable and hardware acceptance are available.
+The Pico W replacement cable now enumerates over USB and diagnostic firmware has flashed with verification. Runtime USB/radio acceptance is still in progress; it does not yet replace the Mac relay. See [Pico bring-up](firmware/pico-w/README.md) for current evidence and cutover requirements.
 
 **Using the Whoop without a phone:** the strap typically **buffers** readings on board when it is not connected to an app or tool; exact retention is firmware-dependent and not specified in this project. You do **not** need to stay connected 24/7 for the device to record. To **copy** data into your database, run `download-history` (or the official app) **periodically**; running `live-server` is only for watching a stream **while** a BLE session is active.
 
@@ -422,3 +422,16 @@ Analysis methods:
 Cards show collecting/partial results until the required signals arrive and update automatically thereafter. No personal training period is required. Live-only gaps cannot be reconstructed unless buffered device history later supplies them.
 
 Checks: `cargo test -p openwhoop-db -p openwhoop`, `/usr/bin/python3 -m unittest discover -s scripts -p 'test_*.py'`, and (from `web/live-dashboard`) `npm run typecheck`, `npm run test:hosted`, `GITHUB_PAGES=true npm run build`.
+
+To inspect a specific leave-and-return interval without mistaking live reconnection
+for historical recovery:
+
+```sh
+python3 scripts/backfill-status.py --database ~/.local/share/openwhoop/relay.sqlite \
+  --start 2026-10-31T15:26:00-04:00 --end 2026-10-31T16:58:00-04:00
+```
+
+The report separates native buffered records from live records and shows the
+buffered device-time cursor. A fresh live BPM or an advancing old archive alone
+does not prove the requested interval has been recovered. Payload revisions also
+refresh their receipt watermark so automatic analysis revisits older dates.
