@@ -571,7 +571,10 @@ impl OpenWhoopCli {
                 anyhow!("DATABASE_URL or --database-url is required for this command")
             })?;
 
-        let adapter = self.create_ble_adapter().await?;
+        warn!("Initializing BLE adapter");
+        let adapter = timeout(Duration::from_secs(60), self.create_ble_adapter())
+            .await
+            .map_err(|_| anyhow!("BLE adapter initialization timed out"))??;
         let db_handler = DatabaseHandler::new(database_url.to_owned()).await;
 
         match self.subcommand {
@@ -775,11 +778,14 @@ impl OpenWhoopCli {
                         .await;
                     session_seq = tracker.state_seq;
 
-                    if let Ok(true) = device.is_connected().await {
-                        let _ = device
-                            .send_command(WhoopPacket::exit_high_freq_sync())
-                            .await;
-                    }
+                    let _ = timeout(Duration::from_secs(5), async {
+                        if let Ok(true) = device.is_connected().await {
+                            let _ = device
+                                .send_command(WhoopPacket::exit_high_freq_sync())
+                                .await;
+                        }
+                    })
+                    .await;
 
                     if should_exit.load(Ordering::SeqCst) {
                         break;
