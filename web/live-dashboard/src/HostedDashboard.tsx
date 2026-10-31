@@ -196,7 +196,7 @@ export default function HostedDashboard() {
   const nextAlarm = alarms.filter(a => a.enabled && a.next_unix).sort((a, b) => (a.next_unix || 0) - (b.next_unix || 0))[0];
   const onStrap = macOnline && relay?.strap_alarm_enabled && nextAlarm?.next_unix === relay.strap_alarm_unix;
 
-  if (!session) return <main className="hosted auth"><h1>OpenWhoop</h1><p>Your private Whoop dashboard.</p>
+  if (!session) return <main className="hosted auth"><div className="auth-brand"><img src={`${import.meta.env.BASE_URL}k-mark.svg`} alt="" /><h1>OpenWhoop</h1></div><p>Your private Whoop dashboard.</p>
     <form onSubmit={event => { event.preventDefault(); void act(async () => {
       const { error } = await supabase.auth.signInWithOtp({ email, options: {
         emailRedirectTo: window.location.origin + import.meta.env.BASE_URL, shouldCreateUser: false,
@@ -209,7 +209,7 @@ export default function HostedDashboard() {
     </form><p role="status">{message}</p></main>;
 
   return <main className="hosted">
-    <header className="hosted-header"><div><small>OPENWHOOP</small><h1>{tab === "pulse" ? "Pulse" : "Alarms"}</h1></div>
+    <header className="hosted-header"><div><div className="brand-line"><img src={`${import.meta.env.BASE_URL}k-mark.svg`} alt="" /><small>OPENWHOOP</small></div><h1>{tab === "pulse" ? "Pulse" : "Alarms"}</h1></div>
       <div className="header-right"><div className="header-status"><span className="battery-state" aria-label={battery == null ? "Whoop battery unavailable" : `Whoop battery ${battery}%`}><span className="battery-icon" aria-hidden="true" />{battery == null ? "—" : `${battery}%`}</span><span className="relay-state"><span className={`led ${live ? "on" : ""}`} />{live ? "Live" : macOnline ? "Mac online" : "Mac offline"}</span></div>
         <button className="text-button" onClick={() => void supabase.auth.signOut()}>Sign out</button></div></header>
     <nav aria-label="Dashboard"><button className={tab === "pulse" ? "active" : ""} onClick={() => setTab("pulse")}>Pulse</button>

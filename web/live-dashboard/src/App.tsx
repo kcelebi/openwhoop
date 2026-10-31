@@ -874,17 +874,20 @@ export default function App() {
         }}
       >
         <div style={{ minWidth: 0 }}>
-          <h1
-            style={{
-              fontFamily: '"Fraunces", Georgia, serif',
-              fontWeight: 700,
-              fontSize: "1.85rem",
-              letterSpacing: "-0.02em",
-              margin: "0 0 0.35rem",
-            }}
-          >
-            OpenWhoop Studio
-          </h1>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.65rem", marginBottom: "0.35rem" }}>
+            <img src={`${import.meta.env.BASE_URL}k-mark.svg`} alt="" width={32} height={32} />
+            <h1
+              style={{
+                fontFamily: '"Fraunces", Georgia, serif',
+                fontWeight: 700,
+                fontSize: "1.85rem",
+                letterSpacing: "-0.02em",
+                margin: 0,
+              }}
+            >
+              OpenWhoop Studio
+            </h1>
+          </div>
           <p style={{ margin: 0, color: "var(--muted)", fontSize: "0.95rem" }}>
             Heart rate, recovery context, and strap controls in one place.
           </p>

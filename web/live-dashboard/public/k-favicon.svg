@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-label="OpenWhoop K">
+  <rect width="64" height="64" rx="14" fill="#102119"/>
+  <g stroke="#f0fff4" stroke-width="11" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M25 11 16 53"/>
+    <path d="M48 11 25 34"/>
+    <path d="M27 34 48 53"/>
+  </g>
+</svg>
