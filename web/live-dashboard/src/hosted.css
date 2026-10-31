@@ -6,6 +6,10 @@
 .hosted button{border:1px solid #355045;border-radius:12px;background:#203629;color:#f0fff4;padding:10px 15px;font:inherit;cursor:pointer;min-height:44px}
 .hosted button:disabled{opacity:.5;cursor:default}
 .hosted-header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:10px 0 26px}
+.brand-line{display:flex;align-items:center;gap:6px;min-height:20px}
+.brand-line img{display:block;width:20px;height:20px;flex:none}
+.auth-brand{display:flex;align-items:center;gap:14px}
+.auth-brand img{display:block;width:42px;height:42px;flex:none}
 .header-right{display:flex;align-items:flex-end;flex-direction:column;gap:5px}
 .header-status{display:flex;align-items:center;gap:12px}
 .battery-state{display:inline-flex;align-items:center;gap:6px;color:#bdd1c3;font-size:.85rem;white-space:nowrap}
