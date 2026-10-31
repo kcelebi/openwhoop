@@ -83,6 +83,10 @@ For local operation, build the binary and use an ignored `.env.cloud` containing
 
 On the configured Mac, `scripts/install-mac-relay.sh` installs a per-user LaunchAgent that restarts the relay after login and prevents idle sleep while it runs. It uses `~/.local/share/openwhoop/relay.sqlite` and keeps `.env.cloud` local. Closing a laptop lid can still suspend Bluetooth and prevent the Mac from advancing a sequence.
 
+The Mac LaunchAgent sets `OPENWHOOP_HISTORY_SYNC=false` to prioritize alarm readback and live GATT heart rate over bulk history downloads. `live-server` otherwise keeps automatic history sync enabled. Use `download-history` separately when you want buffered readings imported; it may compete with alarm controls while it runs.
+
+When Supabase is configured, the Mac schedules only alarms synced from the hosted dashboard. Older schedules in its local SQLite database remain stored but cannot trigger an unseen alarm. A standalone `live-server` without Supabase continues to use local schedules.
+
 The Pico W folder is an unflashed radio bring-up stub. It does not connect to the Whoop, decode heart rate, or forward data; it remains deferred until the correct cable and hardware acceptance are available.
 
 **Using the Whoop without a phone:** the strap typically **buffers** readings on board when it is not connected to an app or tool; exact retention is firmware-dependent and not specified in this project. You do **not** need to stay connected 24/7 for the device to record. To **copy** data into your database, run `download-history` (or the official app) **periodically**; running `live-server` is only for watching a stream **while** a BLE session is active.

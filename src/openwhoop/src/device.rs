@@ -347,13 +347,18 @@ impl WhoopDevice {
         jobs: &mut mpsc::Receiver<StudioDeviceJob>,
         tracker: &mut SessionTracker,
         scan_cycle: u32,
+        history_sync: bool,
     ) -> anyhow::Result<()> {
         let mut notifications = self.peripheral.notifications().await?;
 
         self.emit_session_state(tracker, SessionState::Syncing, "notifications_ready");
-        self.send_command(WhoopPacket::history_start()).await?;
-        self.emit_session_state(tracker, SessionState::CatchingUp, "history_start_sent");
-        info!("Sent history_start; studio device API + BLE notifications active");
+        if history_sync {
+            self.send_command(WhoopPacket::history_start()).await?;
+            self.emit_session_state(tracker, SessionState::CatchingUp, "history_start_sent");
+            info!("Sent history_start; studio device API + BLE notifications active");
+        } else {
+            info!("Live heart rate and device controls active; automatic history sync disabled");
+        }
 
         let mut rx_count: u64 = 0;
 
@@ -408,7 +413,7 @@ impl WhoopDevice {
                     if let Some(packet) = self.whoop.handle_packet(packet).await? {
                         self.send_command(packet).await?;
                     }
-                    if self.whoop.take_history_refresh_requested() {
+                    if self.whoop.take_history_refresh_requested() && history_sync {
                         info!("HistoryComplete: issuing history_start for incremental window");
                         self.send_command(WhoopPacket::history_start()).await?;
                         self.emit_session_state(
@@ -428,9 +433,11 @@ impl WhoopDevice {
                             self.emit_connection_health(attempt, scan_cycle);
                             if self.connect().await.is_ok() {
                                 self.initialize().await?;
-                                self.send_command(WhoopPacket::history_start()).await?;
                                 self.emit_session_state(tracker, SessionState::Syncing, "reconnected");
-                                self.emit_session_state(tracker, SessionState::CatchingUp, "history_start_after_reconnect");
+                                if history_sync {
+                                    self.send_command(WhoopPacket::history_start()).await?;
+                                    self.emit_session_state(tracker, SessionState::CatchingUp, "history_start_after_reconnect");
+                                }
                                 tracker.live_probe_streak = 0;
                                 rx_count = 0;
                                 continue 'a;
@@ -449,7 +456,7 @@ impl WhoopDevice {
                     // Keep nudging history even while a Studio API request (battery/alarm) is
                     // waiting on CMD_FROM_STRAP — otherwise a stuck or slow command response
                     // stops history_start and the Pulse stream goes quiet after "sync".
-                    if quiet {
+                    if quiet && history_sync {
                         let _ = self.send_command(WhoopPacket::history_start()).await;
                         if tracker.state == SessionState::Live || tracker.state == SessionState::LiveWarmup {
                             self.emit_session_state(tracker, SessionState::OutOfSync, "quiet_link_nudge");
@@ -457,7 +464,7 @@ impl WhoopDevice {
                     }
 
                     let wall_now = Utc::now().timestamp_millis();
-                    if let Some(lag_ms) = self.whoop.latest_lag_ms(wall_now) {
+                    if let Some(lag_ms) = history_sync.then(|| self.whoop.latest_lag_ms(wall_now)).flatten() {
                         self.emit_lag_probe(lag_ms, Self::LAG_THRESHOLD_MS);
                         let (next, streak) = Self::next_state_from_lag_probe(
                             tracker.state,
