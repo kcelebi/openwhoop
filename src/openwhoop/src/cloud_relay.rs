@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{MissedTickBehavior, interval, timeout},
+    time::{Instant, MissedTickBehavior, interval, interval_at, timeout},
 };
 use uuid::Uuid;
 
@@ -333,6 +333,7 @@ async fn update_heartbeat(
     client: &Client,
     last_hr: &Arc<Mutex<Option<String>>>,
     strap_state: &Arc<Mutex<Option<Option<i64>>>>,
+    battery_state: &Arc<Mutex<Option<(u8, DateTime<Utc>)>>>,
 ) -> anyhow::Result<()> {
     let sample = last_hr.lock().ok().and_then(|guard| guard.clone());
     let sample: Option<Value> = sample.as_deref().and_then(|s| serde_json::from_str(s).ok());
@@ -342,12 +343,15 @@ async fn update_heartbeat(
         .and_then(Value::as_i64);
     let fresh = current_unix_ms.is_some_and(|ms| Utc::now().timestamp_millis() - ms < 45_000);
     let strap = strap_state.lock().ok().and_then(|state| *state);
+    let battery = battery_state.lock().ok().and_then(|state| state.clone());
     let payload = json!({
         "owner_id": cfg.owner_id,
         "last_seen_at": Utc::now(),
         "connected": fresh,
         "current_bpm": if fresh { sample.as_ref().and_then(|v| v.get("bpm")).and_then(Value::as_i64) } else { None },
         "current_unix_ms": current_unix_ms,
+        "battery_percent": battery.as_ref().map(|(percent, _)| percent),
+        "battery_updated_at": battery.as_ref().map(|(_, updated_at)| updated_at),
         "strap_alarm_enabled": strap.map(|unix| unix.is_some()),
         "strap_alarm_unix": strap.flatten(),
     });
@@ -363,6 +367,46 @@ async fn update_heartbeat(
         .await?;
     checked(response).await?;
     Ok(())
+}
+
+async fn poll_battery(
+    jobs: mpsc::Sender<StudioDeviceJob>,
+    state: Arc<Mutex<Option<(u8, DateTime<Utc>)>>>,
+    exit: Arc<AtomicBool>,
+) {
+    // Keep battery requests out of the heartbeat loop and leave startup alarm
+    // reconciliation time to finish before the first poll.
+    let mut tick = interval_at(
+        Instant::now() + Duration::from_secs(12),
+        Duration::from_secs(60),
+    );
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    while !exit.load(Ordering::SeqCst) {
+        tick.tick().await;
+        let result: anyhow::Result<u8> = async {
+            let (reply, response) = oneshot::channel();
+            timeout(
+                Duration::from_secs(2),
+                jobs.send(StudioDeviceJob::PollBattery { reply }),
+            )
+            .await??;
+            let value = timeout(Duration::from_secs(8), response)
+                .await??
+                .map_err(anyhow::Error::msg)?;
+            let percent = value
+                .get("percent")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("battery percentage unavailable"))?;
+            anyhow::ensure!(percent <= 100, "invalid battery percentage");
+            Ok(percent as u8)
+        }
+        .await;
+        if let Ok(percent) = result {
+            if let Ok(mut current) = state.lock() {
+                *current = Some((percent, Utc::now()));
+            }
+        }
+    }
 }
 
 pub async fn run(
@@ -383,6 +427,12 @@ pub async fn run(
     };
     let mut tick = interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let battery_state = Arc::new(Mutex::new(None));
+    let battery_task = tokio::spawn(poll_battery(
+        jobs.clone(),
+        battery_state.clone(),
+        exit.clone(),
+    ));
     let mut last_heartbeat = 0;
     while !exit.load(Ordering::SeqCst) {
         tick.tick().await;
@@ -397,11 +447,14 @@ pub async fn run(
         }
         let now = Utc::now().timestamp();
         if now - last_heartbeat >= 10 {
-            if let Err(error) = update_heartbeat(&cfg, &client, &last_hr, &strap_state).await {
+            if let Err(error) =
+                update_heartbeat(&cfg, &client, &last_hr, &strap_state, &battery_state).await
+            {
                 log::warn!("cloud heartbeat pending: {error}");
             } else {
                 last_heartbeat = now;
             }
         }
     }
+    battery_task.abort();
 }

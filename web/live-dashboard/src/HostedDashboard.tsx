@@ -26,6 +26,8 @@ type Sample = { recorded_at_ms: number; bpm: number };
 type Relay = {
   last_seen_at: string;
   connected: boolean;
+  battery_percent: number | null;
+  battery_updated_at: string | null;
   strap_alarm_enabled: boolean | null;
   strap_alarm_unix: number | null;
 };
@@ -178,6 +180,8 @@ export default function HostedDashboard() {
   const live = lastSampleAt != null && now - lastSampleAt < 30_000;
   const macOnline = live || (lastHeartbeatAt != null && now - lastHeartbeatAt < 30_000);
   const bpm = live ? samples.at(-1)?.bpm : null;
+  const batteryFresh = relay?.battery_updated_at && now - new Date(relay.battery_updated_at).getTime() < 10 * 60_000;
+  const battery = macOnline && batteryFresh ? relay?.battery_percent : null;
   const nextAlarm = alarms.filter(a => a.enabled && a.next_unix).sort((a, b) => (a.next_unix || 0) - (b.next_unix || 0))[0];
   const onStrap = macOnline && relay?.strap_alarm_enabled && nextAlarm?.next_unix === relay.strap_alarm_unix;
 
@@ -195,7 +199,7 @@ export default function HostedDashboard() {
 
   return <main className="hosted">
     <header className="hosted-header"><div><small>OPENWHOOP</small><h1>{tab === "pulse" ? "Pulse" : "Alarms"}</h1></div>
-      <div className="header-right"><span className="relay-state"><span className={`led ${live ? "on" : ""}`} />{live ? "Live" : macOnline ? "Mac online" : "Mac offline"}</span>
+      <div className="header-right"><div className="header-status"><span className="battery-state" aria-label={battery == null ? "Whoop battery unavailable" : `Whoop battery ${battery}%`}><span className="battery-icon" aria-hidden="true" />{battery == null ? "—" : `${battery}%`}</span><span className="relay-state"><span className={`led ${live ? "on" : ""}`} />{live ? "Live" : macOnline ? "Mac online" : "Mac offline"}</span></div>
         <button className="text-button" onClick={() => void supabase.auth.signOut()}>Sign out</button></div></header>
     <nav aria-label="Dashboard"><button className={tab === "pulse" ? "active" : ""} onClick={() => setTab("pulse")}>Pulse</button>
       <button className={tab === "alarms" ? "active" : ""} onClick={() => setTab("alarms")}>Alarms</button></nav>
@@ -208,15 +212,16 @@ export default function HostedDashboard() {
         <Tooltip labelFormatter={value => new Date(Number(value)).toLocaleString()} formatter={value => [`${value} BPM`, "Heart rate"]} />
         <Line dataKey="bpm" type="monotone" stroke="#67e8a0" strokeWidth={2} dot={false} isAnimationActive={false} />
       </LineChart></ResponsiveContainer></div></section></> : <>
-      <section className="alarm-heading"><div><h2>Your alarms</h2><p>{!nextAlarm ? "No alarm armed" : onStrap ? `Next alarm synced to Whoop · ${displayTime(cronParts(nextAlarm).time)}` : macOnline ? "Checking Whoop alarm…" : "Mac offline · waiting to sync"}</p></div>
+      <section className="alarm-heading"><p>{!nextAlarm ? "No alarm armed" : onStrap ? `Synced to Whoop · ${displayTime(cronParts(nextAlarm).time)}` : macOnline ? "Checking Whoop alarm…" : "Mac offline · waiting to sync"}</p>
         <button className="add-alarm" onClick={() => setDraft(blankDraft())}>+ Add</button></section>
       {draft && <section className="panel alarm-editor"><div className="editor-title"><h2>{draft.id ? "Edit alarm" : "New alarm"}</h2><button className="text-button" onClick={() => setDraft(null)}>Cancel</button></div>
-        <label>Time<input type="time" required value={draft.time} onChange={event => setDraft({ ...draft, time: event.target.value })} /></label>
-        <label>Label<input maxLength={120} value={draft.label} onChange={event => setDraft({ ...draft, label: event.target.value })} /></label>
-        <div className="repeat-title">Repeat <span>{repeatLabel(draft.days)}</span></div>
-        <div className="days">{DAYS.map((name, index) => <button key={name} className={draft.days.includes(index) ? "selected" : ""}
-          aria-pressed={draft.days.includes(index)} onClick={() => setDraft({ ...draft,
-            days: draft.days.includes(index) ? draft.days.filter(day => day !== index) : [...draft.days, index].sort() })}>{name}</button>)}</div>
+        <label className="time-field">Time<input type="time" required value={draft.time} onChange={event => setDraft({ ...draft, time: event.target.value })} /></label>
+        <details className="repeat-settings"><summary>Repeat <span>{repeatLabel(draft.days)}</span></summary>
+          <div className="days">{DAYS.map((name, index) => <button key={name} type="button" className={draft.days.includes(index) ? "selected" : ""}
+            aria-pressed={draft.days.includes(index)} onClick={() => setDraft({ ...draft,
+              days: draft.days.includes(index) ? draft.days.filter(day => day !== index) : [...draft.days, index].sort() })}>{name}</button>)}</div>
+          <label>Label<input maxLength={120} value={draft.label} onChange={event => setDraft({ ...draft, label: event.target.value })} /></label>
+        </details>
         <div className="editor-actions"><button disabled={busy} onClick={() => void act(saveAlarm)}>Save alarm</button>
           {draft.id && <button className="delete" disabled={busy} onClick={() => void act(async () => {
             const alarm = alarms.find(item => item.id === draft.id); if (alarm) await remove(alarm); setDraft(null);
@@ -227,16 +232,16 @@ export default function HostedDashboard() {
         return <div className={`alarm-row ${alarm.enabled ? "" : "off"}`} key={alarm.id}>
           <button className="alarm-open" onClick={() => setDraft({ id: alarm.id, label: alarm.label, time, days })} aria-label={`Edit ${alarm.label}`}>
             <span className="alarm-time">{alarm.kind === "cron" ? displayTime(time) : new Date((alarm.one_time_unix || 0) * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</span>
-            <span className="alarm-sub">{alarm.label} · {alarm.kind === "cron" ? repeatLabel(days) : "Once"}</span>
-            <span className={`alarm-status ${state === "Synced to Whoop" ? "synced" : ""}`}>{state}</span>
+            <span className="alarm-sub">{alarm.label === "Alarm" ? (alarm.kind === "cron" ? repeatLabel(days) : "Once") : `${alarm.label} · ${alarm.kind === "cron" ? repeatLabel(days) : "Once"}`}</span>
+            {(state !== "Queued" && state !== "Off") && <span className={`alarm-status ${state === "Synced to Whoop" ? "synced" : ""}`}>{state}</span>}
           </button><label className="switch" aria-label={`Enable ${alarm.label}`}><input type="checkbox" checked={alarm.enabled} disabled={busy} onChange={() => void act(() => toggle(alarm))} /><span /></label>
         </div>;
       })}</section>
       <div className="resync-row"><button disabled={busy || !macOnline} onClick={() => void act(() => sendCommand("resync_alarm"))}>↻ Resync Whoop</button></div>
-      <section className="haptic-tools"><button disabled={busy || !macOnline} onClick={() => void act(() => sendCommand("buzzer"))}>Test buzz</button>
+      <details className="alarm-tools"><summary>Test & controls</summary><section className="haptic-tools"><button disabled={busy || !macOnline} onClick={() => void act(() => sendCommand("buzzer"))}>Test buzz</button>
         <button disabled={busy || !macOnline} onClick={() => void act(() => sendCommand("stop_buzzer"))}>Stop buzz</button>
         <small>The tested buzz pattern can last 10–15 seconds; stop may lag.</small>
-        {command && <small>Last command: {command.kind} · {command.status}</small>}</section>
+        {command && <small>Last command: {command.kind} · {command.status}</small>}</section></details>
     </>}
     {message && <p role="status" className="message">{message}</p>}
   </main>;
