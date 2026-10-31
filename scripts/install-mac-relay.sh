@@ -24,6 +24,8 @@ cat > "$plist" <<EOF
 <key>WorkingDirectory</key><string>$repo_dir</string>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><true/>
+<key>ProcessType</key><string>Interactive</string>
+<key>ExitTimeOut</key><integer>5</integer>
 <key>StandardOutPath</key><string>$log_dir/relay.log</string>
 <key>StandardErrorPath</key><string>$log_dir/relay.log</string>
 </dict></plist>
