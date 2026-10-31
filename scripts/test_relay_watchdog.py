@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import importlib.util
 import sys
+import time
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('relay_watchdog', Path(__file__).with_name('relay-watchdog.py'))
@@ -47,6 +48,12 @@ class WatchdogTests(unittest.TestCase):
         self.run_at(185)
         self.run_at(270)
         restart.assert_not_called()
+
+    @patch('relay_watchdog.subprocess.run')
+    def test_persisted_wall_clock_deadline_works_with_real_system_clock(self, restart):
+        Path(self.state).write_text(json.dumps({'sample': 1000, 'last_progress': time.time() - 91}))
+        check(self.db, self.state)
+        restart.assert_called_once()
 
     @patch('relay_watchdog.subprocess.run')
     def test_backwards_clock_change_resets_timer(self, restart):
