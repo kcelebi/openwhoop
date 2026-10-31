@@ -625,6 +625,8 @@ impl OpenWhoopCli {
             OpenWhoopCommand::LiveServer { whoop, port } => {
                 let (live_tx, _) = broadcast::channel::<String>(512);
                 let live_hr_snapshot = Arc::new(Mutex::new(None::<String>));
+                let strap_alarm_state = Arc::new(Mutex::new(None::<Option<i64>>));
+                let force_alarm_recheck = Arc::new(AtomicBool::new(false));
                 let should_exit = Arc::new(AtomicBool::new(false));
                 let se = should_exit.clone();
                 ctrlc::set_handler(move || {
@@ -646,12 +648,16 @@ impl OpenWhoopCli {
                         job_tx.clone(),
                         live_hr_snapshot.clone(),
                         should_exit.clone(),
+                        force_alarm_recheck.clone(),
+                        strap_alarm_state.clone(),
                     ))
                 });
                 let alarm_task = tokio::spawn(alarm_runtime::run(
                     db_handler.clone(),
                     job_tx,
                     should_exit.clone(),
+                    force_alarm_recheck,
+                    strap_alarm_state,
                 ));
                 let _server = tokio::spawn(async move {
                     if let Err(e) = live_server::run(app_state, port).await {

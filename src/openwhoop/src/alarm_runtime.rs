@@ -3,7 +3,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -56,7 +56,13 @@ async fn set_strap_alarm(
     Ok(())
 }
 
-pub async fn run(db: DatabaseHandler, jobs: mpsc::Sender<StudioDeviceJob>, exit: Arc<AtomicBool>) {
+pub async fn run(
+    db: DatabaseHandler,
+    jobs: mpsc::Sender<StudioDeviceJob>,
+    exit: Arc<AtomicBool>,
+    force_recheck: Arc<AtomicBool>,
+    strap_state: Arc<Mutex<Option<Option<i64>>>>,
+) {
     let mut tick = interval(RECHECK_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_verified: Option<Option<i64>> = None;
@@ -68,7 +74,10 @@ pub async fn run(db: DatabaseHandler, jobs: mpsc::Sender<StudioDeviceJob>, exit:
             db.expire_past_alarm_schedules(now - LATE_GRACE_SECS)
                 .await?;
             let desired = db.next_enabled_alarm_unix(now - LATE_GRACE_SECS).await?;
-            if last_verified == Some(desired) && now - last_readback_unix < READBACK_INTERVAL_SECS {
+            if !force_recheck.swap(false, Ordering::SeqCst)
+                && last_verified == Some(desired)
+                && now - last_readback_unix < READBACK_INTERVAL_SECS
+            {
                 return Ok(());
             }
 
@@ -93,12 +102,18 @@ pub async fn run(db: DatabaseHandler, jobs: mpsc::Sender<StudioDeviceJob>, exit:
                 db.mark_alarm_programmed(unix).await?;
             }
             last_verified = Some(desired);
+            if let Ok(mut state) = strap_state.lock() {
+                *state = Some(desired);
+            }
             last_readback_unix = Utc::now().timestamp();
             Ok(())
         }
         .await;
         if let Err(error) = result {
             last_verified = None;
+            if let Ok(mut state) = strap_state.lock() {
+                *state = None;
+            }
             log::warn!("alarm reconciliation pending: {error}");
         }
     }
