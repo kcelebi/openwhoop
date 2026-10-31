@@ -25,7 +25,7 @@ class WatchdogTests(unittest.TestCase):
             c.execute('insert into cloud_hr_outbox values (1000)')
 
     def run_at(self, seconds):
-        with patch('relay_watchdog.time.monotonic', return_value=seconds):
+        with patch('relay_watchdog.time.time', return_value=seconds):
             check(self.db, self.state)
 
     @patch('relay_watchdog.subprocess.run')
@@ -49,7 +49,7 @@ class WatchdogTests(unittest.TestCase):
         restart.assert_not_called()
 
     @patch('relay_watchdog.subprocess.run')
-    def test_reboot_resets_monotonic_timer(self, restart):
+    def test_backwards_clock_change_resets_timer(self, restart):
         self.run_at(500)
         self.run_at(10)
         restart.assert_not_called()

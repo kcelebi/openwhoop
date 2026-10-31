@@ -10,7 +10,9 @@ import time
 
 
 def check(database, state_path):
-    now = time.monotonic()
+    # macOS Python 3.9's monotonic epoch differs between processes. This
+    # LaunchAgent runs once per check, so persist a shared wall-clock epoch.
+    now = time.time()
     sample = None
     try:
         with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2) as connection:
