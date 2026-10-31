@@ -109,7 +109,7 @@ export default function HostedDashboard() {
       }
       lastHeartbeatRef.current = nextRelay?.last_seen_at || null;
       setSamples(points);
-      setAlarms((alarmRows.data || []) as Alarm[]);
+      setAlarms(((alarmRows.data || []) as Alarm[]).sort((a, b) => cronParts(a).time.localeCompare(cronParts(b).time)));
       setRelay(nextRelay);
       setCommand((commands.data?.[0] || null) as Command | null);
       setMessage(current => current.startsWith("Could not refresh") ? "" : current);
