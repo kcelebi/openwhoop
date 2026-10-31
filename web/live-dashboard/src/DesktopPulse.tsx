@@ -48,7 +48,7 @@ function DesktopPulse({ client, owner }: { client: SupabaseClient; owner: string
     };
     void load().catch(e => { if (!controller.signal.aborted) { setError(String(e)); setLoading(false); } });
     return () => controller.abort();
-  }, [client, owner, start, end]);
+  }, [client, owner, start, end, now]);
   const points = useMemo(() => {
     const result: Point[] = [];
     for (const point of history?.points || []) {
