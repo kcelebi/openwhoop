@@ -1,7 +1,9 @@
 #[macro_use]
 extern crate log;
 
+mod alarm_runtime;
 mod app_state;
+mod cloud_relay;
 mod live_server;
 mod studio;
 
@@ -540,7 +542,11 @@ impl OpenWhoopCli {
             OpenWhoopCommand::LiveServer { .. } => {
                 // LiveServer has its own match arm
             }
-            OpenWhoopCommand::Scheduler { interval_secs, device_id, studio_url } => {
+            OpenWhoopCommand::Scheduler {
+                interval_secs,
+                device_id,
+                studio_url,
+            } => {
                 let db_url = self.database_url.as_deref().ok_or_else(|| {
                     anyhow!("DATABASE_URL or --database-url is required for scheduler")
                 })?;
@@ -554,10 +560,16 @@ impl OpenWhoopCli {
         }
 
         // For other commands, DATABASE_URL is required
-        let database_url = self.database_url.as_deref().or_else(|| {
-            matches!(self.subcommand, OpenWhoopCommand::LiveServer { .. })
-                .then_some("sqlite:openwhoop.db")
-        }).ok_or_else(|| anyhow!("DATABASE_URL or --database-url is required for this command"))?;
+        let database_url = self
+            .database_url
+            .as_deref()
+            .or_else(|| {
+                matches!(self.subcommand, OpenWhoopCommand::LiveServer { .. })
+                    .then_some("sqlite:openwhoop.db")
+            })
+            .ok_or_else(|| {
+                anyhow!("DATABASE_URL or --database-url is required for this command")
+            })?;
 
         let adapter = self.create_ble_adapter().await?;
         let db_handler = DatabaseHandler::new(database_url.to_owned()).await;
@@ -625,8 +637,22 @@ impl OpenWhoopCli {
                     db: Some(db_handler.clone()),
                     ws_tx: live_tx.clone(),
                     last_hr_json: live_hr_snapshot.clone(),
-                    job_tx,
+                    job_tx: job_tx.clone(),
                 };
+                let cloud_task = cloud_relay::CloudConfig::from_env()?.map(|cfg| {
+                    tokio::spawn(cloud_relay::run(
+                        cfg,
+                        db_handler.clone(),
+                        job_tx.clone(),
+                        live_hr_snapshot.clone(),
+                        should_exit.clone(),
+                    ))
+                });
+                let alarm_task = tokio::spawn(alarm_runtime::run(
+                    db_handler.clone(),
+                    job_tx,
+                    should_exit.clone(),
+                ));
                 let _server = tokio::spawn(async move {
                     if let Err(e) = live_server::run(app_state, port).await {
                         error!("live server: {}", e);
@@ -755,6 +781,10 @@ impl OpenWhoopCli {
                         sleep(Duration::from_secs(5)).await;
                         continue;
                     }
+                }
+                alarm_task.abort();
+                if let Some(task) = cloud_task {
+                    task.abort();
                 }
             }
             OpenWhoopCommand::ReRun => {

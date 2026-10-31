@@ -71,7 +71,17 @@ While the strap is connected over BLE, OpenWhoop can push parsed samples (heart 
 
    Dashboard e2e (mock WebSocket, no Whoop): from `web/live-dashboard`, run `npx playwright install chromium` once, then `npm run test:e2e` (uses port **5199** so it does not clash with a manual dev server on 5173).
 
-**What “live” means here:** samples are emitted from the same **history / high-frequency sync** path OpenWhoop already uses when downloading data, not from a separate phone-style realtime mode. You will see BPM and related fields when the device is streaming those packets during the session.
+**Live heart rate:** the Mac subscribes to the standard BLE Heart Rate Measurement characteristic. Historical sync runs separately and does not replace a fresh live BPM with old buffered readings.
+
+### Hosted dashboard and Mac relay
+
+The private dashboard is built for GitHub Pages at `https://kcelebi.github.io/openwhoop/`. It signs in with a Supabase email link and reads only the signed-in owner's rows. The Mac owns the Whoop BLE connection and pushes live heart rate to Supabase. Alarm edits and buzz commands flow from Supabase to the Mac; the Mac keeps the earliest enabled alarm programmed on the strap and verifies its readback. The browser never receives the Mac's service key.
+
+For local operation, build the binary and use an ignored `.env.cloud` containing `OPENWHOOP_SUPABASE_URL`, `OPENWHOOP_SUPABASE_SECRET_KEY`, and `OPENWHOOP_SUPABASE_OWNER_ID`. Start `live-server --whoop <device-name>` with a persistent SQLite `DATABASE_URL`. Keep the Mac awake and within Bluetooth range. If it goes offline, the already programmed strap alarm may still fire, but later alarms cannot be advanced until the relay resumes. Treat the hosted status as stale after 30 seconds without a heartbeat.
+
+On the configured Mac, `scripts/install-mac-relay.sh` installs a per-user LaunchAgent that restarts the relay after login and prevents idle sleep while it runs. It uses `~/.local/share/openwhoop/relay.sqlite` and keeps `.env.cloud` local. Closing a laptop lid can still suspend Bluetooth and prevent the Mac from advancing a sequence.
+
+The Pico W folder is an unflashed radio bring-up stub. It does not connect to the Whoop, decode heart rate, or forward data; it remains deferred until the correct cable and hardware acceptance are available.
 
 **Using the Whoop without a phone:** the strap typically **buffers** readings on board when it is not connected to an app or tool; exact retention is firmware-dependent and not specified in this project. You do **not** need to stay connected 24/7 for the device to record. To **copy** data into your database, run `download-history` (or the official app) **periodically**; running `live-server` is only for watching a stream **while** a BLE session is active.
 

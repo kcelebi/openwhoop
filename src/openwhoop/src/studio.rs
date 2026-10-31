@@ -193,7 +193,8 @@ async fn insights_heart_rate_series(
         StatusCode::BAD_REQUEST,
         "Invalid range. Use 1h, 24h, or 7d.".to_string(),
     ))?;
-    let from = q.since_ms
+    let from = q
+        .since_ms
         .and_then(|ms| Local.timestamp_millis_opt(ms).single())
         .map(|dt| dt.naive_local())
         .unwrap_or_else(|| Local::now().naive_local() - ChDuration::hours(hours));
@@ -464,9 +465,12 @@ async fn alarms_list(State(app): State<AppState>) -> Result<Json<Value>, (Status
                 "label": a.label,
                 "kind": a.kind,
                 "cron_expr": a.cron_expr,
+                "timezone": a.timezone,
                 "one_time_unix": a.one_time_unix,
                 "next_unix": a.next_unix,
                 "last_rang_unix": a.last_rang_unix,
+                "last_missed_unix": a.last_missed_unix,
+                "last_unconfirmed_unix": a.last_unconfirmed_unix,
                 "last_sent_unix": a.last_sent_unix,
                 "enabled": a.enabled,
             })
@@ -481,6 +485,7 @@ struct AlarmCreateBody {
     /// `cron` or `once`
     kind: String,
     cron_expr: Option<String>,
+    timezone: Option<String>,
     one_time_unix: Option<i64>,
 }
 
@@ -497,6 +502,7 @@ async fn alarms_create(
             label: body.label,
             kind: body.kind,
             cron_expr: body.cron_expr,
+            timezone: body.timezone,
             one_time_unix: body.one_time_unix,
         })
         .await

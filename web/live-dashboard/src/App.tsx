@@ -224,9 +224,13 @@ type AlarmItem = {
   label: string;
   kind: "cron" | "once" | string;
   cron_expr?: string | null;
+  timezone?: string;
   one_time_unix?: number | null;
   next_unix?: number | null;
   last_rang_unix?: number | null;
+  last_missed_unix?: number | null;
+  last_unconfirmed_unix?: number | null;
+  last_sent_unix?: number | null;
   enabled: boolean;
 };
 
@@ -279,14 +283,11 @@ function hrChartTooltipLabel(v: number): string {
   });
 }
 
-function HrScatterDot(props: {
-  cx?: number;
-  cy?: number;
-  fill?: string;
-  fillOpacity?: number;
-}) {
-  const { cx, cy, fill, fillOpacity } = props;
-  if (cx == null || cy == null) return null;
+function HrScatterDot(props: unknown) {
+  const { cx, cy, fill, fillOpacity } = props as {
+    cx?: number; cy?: number; fill?: string; fillOpacity?: number;
+  };
+  if (cx == null || cy == null) return <g />;
   return (
     <circle
       cx={cx}
@@ -664,7 +665,7 @@ export default function App() {
   useEffect(() => {
     if (USE_REST_LIVE) return;
     let cancelled = false;
-    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let reconnectTimer: number | undefined;
     let attempt = 0;
     let everOpened = false;
 
@@ -813,15 +814,21 @@ export default function App() {
 
   useEffect(() => {
     if (tab !== "alarms") return;
-    void runApi("alarm-read", async () => {
+    void loadAlarmSchedules();
+    const refreshStrap = async () => {
       const j = (await api("/api/device/alarm")) as {
         enabled?: boolean;
         unix?: number;
       };
       setStrapAlarm({ enabled: j.enabled, unix: j.unix });
-      await loadAlarmSchedules();
-    }).catch(() => {});
-  }, [tab, runApi, loadAlarmSchedules]);
+    };
+    void refreshStrap().catch(() => setStrapAlarm(null));
+    const id = window.setInterval(() => {
+      void loadAlarmSchedules();
+      void refreshStrap().catch(() => setStrapAlarm(null));
+    }, 10_000);
+    return () => window.clearInterval(id);
+  }, [tab, loadAlarmSchedules]);
 
   const lastReceivedAgeMs =
     lastHr?.received_at_ms != null
@@ -1499,8 +1506,8 @@ export default function App() {
               Alarms
             </h2>
             <p style={{ margin: "0 0 1rem", fontSize: "0.88rem", color: "var(--muted)" }}>
-              Configure multiple cron or one-time alarms. Scheduler keeps the next upcoming alarm
-              programmed on the strap while it is in range.
+              Configure multiple alarms. The Mac keeps the next enabled alarm programmed on the
+              strap while it is connected. Check the strap status below before relying on it.
             </p>
             {strapAlarm != null ? (
               <div
@@ -1524,7 +1531,7 @@ export default function App() {
                 ) : null}
               </div>
             ) : (
-              <p style={{ color: "var(--muted)", fontSize: "0.85rem" }}>Loading…</p>
+              <p style={{ color: "var(--warn)", fontSize: "0.85rem" }}>Strap status unavailable. Saved alarms may be pending.</p>
             )}
           </div>
 
@@ -1619,6 +1626,7 @@ export default function App() {
                         ? {
                             label: alarmLabel.trim(),
                             kind: "once",
+                            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
                             one_time_unix: Math.floor(
                               new Date(alarmLocal).getTime() / 1000,
                             ),
@@ -1627,18 +1635,14 @@ export default function App() {
                             label: alarmLabel.trim(),
                             kind: "cron",
                             cron_expr: alarmCronExpr.trim(),
+                            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
                           };
                     await api("/api/alarms", {
                       method: "POST",
                       body: JSON.stringify(body),
                     });
                     await loadAlarmSchedules();
-                    const st = (await api("/api/device/alarm")) as {
-                      enabled?: boolean;
-                      unix?: number;
-                    };
-                    setStrapAlarm({ enabled: st.enabled, unix: st.unix });
-                    setDeviceNote("Alarm saved. Scheduler will program the next trigger.");
+                    setDeviceNote("Alarm saved. Waiting for Mac and strap confirmation.");
                   })
                 }
               >
@@ -1646,7 +1650,7 @@ export default function App() {
               </button>
             </div>
             <p style={{ margin: "0.6rem 0 0", color: "var(--muted)", fontSize: "0.8rem" }}>
-              Cron uses standard 5-field format in local time.
+              Cron uses standard 5-field format in {Intl.DateTimeFormat().resolvedOptions().timeZone}.
             </p>
           </div>
 
@@ -1710,7 +1714,7 @@ export default function App() {
                     </div>
                     <div style={{ fontSize: "0.78rem", color: "var(--muted)" }}>
                       {a.kind === "cron" && a.cron_expr
-                        ? `cron: ${a.cron_expr}`
+                        ? `cron: ${a.cron_expr} · ${a.timezone ?? "UTC"}`
                         : a.one_time_unix
                           ? `one-time: ${new Date(a.one_time_unix * 1000).toLocaleString()}`
                           : "—"}
@@ -1725,10 +1729,21 @@ export default function App() {
                         ? new Date(a.last_rang_unix * 1000).toLocaleString()
                         : "—"}
                     </div>
+                    <div style={{ fontSize: "0.78rem", color: a.enabled && a.next_unix === strapAlarm?.unix && strapAlarm?.enabled ? "var(--accent)" : "var(--warn)" }}>
+                      {a.enabled
+                        ? a.next_unix === strapAlarm?.unix && strapAlarm?.enabled
+                          ? "Confirmed on strap"
+                          : "Pending strap confirmation"
+                        : "Off"}
+                      {a.last_missed_unix != null ? ` · Last missed: ${new Date(a.last_missed_unix * 1000).toLocaleString()}` : ""}
+                      {a.last_unconfirmed_unix != null ? ` · Last occurrence unconfirmed by telemetry: ${new Date(a.last_unconfirmed_unix * 1000).toLocaleString()}` : ""}
+                    </div>
                   </div>
                   <div style={{ display: "flex", gap: "0.45rem" }}>
                     <button
                       type="button"
+                      disabled={apiBusy}
+                      aria-pressed={a.enabled}
                       style={tabBtn(a.enabled)}
                       onClick={() =>
                         void runApi("toggle-alarm", async () => {
@@ -1737,6 +1752,8 @@ export default function App() {
                             body: JSON.stringify({ enabled: !a.enabled }),
                           });
                           await loadAlarmSchedules();
+                          setStrapAlarm(null);
+                          setDeviceNote("Alarm updated. Waiting for strap confirmation.");
                         })
                       }
                     >
@@ -1744,6 +1761,7 @@ export default function App() {
                     </button>
                     <button
                       type="button"
+                      disabled={apiBusy}
                       style={tabBtn(false)}
                       onClick={() =>
                         void runApi("delete-alarm", async () => {

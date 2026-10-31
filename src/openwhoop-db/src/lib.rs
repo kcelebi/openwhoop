@@ -1,5 +1,5 @@
 mod db;
-pub use db::{AlarmScheduleDraft, AlarmSchedulePatch, DatabaseHandler};
+pub use db::{AlarmScheduleDraft, AlarmSchedulePatch, CloudAlarmInput, DatabaseHandler};
 
 mod algo_impl;
 pub use algo_impl::TempReading;

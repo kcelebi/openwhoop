@@ -4,6 +4,7 @@ pub mod prelude;
 
 pub mod activities;
 pub mod alarm_schedules;
+pub mod cloud_hr_outbox;
 pub mod command_queue;
 pub mod heart_rate;
 pub mod packets;

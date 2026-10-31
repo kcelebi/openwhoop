@@ -2,6 +2,7 @@
 
 pub use super::activities::Entity as Activities;
 pub use super::alarm_schedules::Entity as AlarmSchedules;
+pub use super::cloud_hr_outbox::Entity as CloudHrOutbox;
 pub use super::heart_rate::Entity as HeartRate;
 pub use super::packets::Entity as Packets;
 pub use super::sleep_cycles::Entity as SleepCycles;
