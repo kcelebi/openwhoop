@@ -8,11 +8,19 @@ continues to own the WHOOP connection, alarms, and cloud synchronization.
 - The replacement cable carries USB data: the board enumerates as `RP2 Boot`,
   mounts `RPI-RP2`, and responds to picotool.
 - RP2040 B2, 2 MiB flash; Pico SDK 2.3.1 and xPack Arm GCC 12.2.1 build both targets.
-- The radio image flashed and its flash contents verified. USB CDC enumerated,
-  but runtime logging/radio initialization has **not** passed acceptance.
-- A separate USB-only probe is built to isolate the USB runtime from CYW43/BTstack.
-  If the running image does not respond to software reboot, hold BOOTSEL while
-  reconnecting the board before flashing this probe.
+- The USB-only C probe prints repeated heartbeats. Cable/USB runtime acceptance passes.
+- The custom C radio image flashes/verifies, but its startup hangs; C radio runtime
+  is **not** accepted.
+- Official MicroPython 1.29.0 for Pico W boots and runs USB REPL normally. It
+  activated Wi-Fi and found 20 networks, activated BLE, and completed a passive
+  scan with 1,036 reports including 53 WHOOP advertisements. No Wi-Fi credentials
+  or cloud secrets are installed on the board.
+- Official firmware URL: https://micropython.org/resources/firmware/RPI_PICO_W-20260824-v1.29.0.uf2
+  SHA-256: `f918c0a082c6daf53e27998b7f990ba5f065db2e298b21a34024532a20786794`.
+- A controlled Mac/Pico handoff received six live BPM/RR notifications, verified
+  the CCCD write response, durably saved all six raw and decoded readings to the
+  local outbox, and restored the Mac. This is USB-hosted BLE acceptance, **not**
+  Pico-to-cloud-over-Wi-Fi acceptance.
 - A full flash backup was saved outside the repository before the first flash.
 
 ## Build
@@ -36,21 +44,43 @@ It reports aggregate scan counts and WHOOP names, without printing nearby SSIDs.
 Start with the USB-only image and verify serial output before testing radios:
 
 ```sh
-picotool load -v -x firmware/pico-w/build/pico_usb_probe.uf2
+picotool load -v firmware/pico-w/build/pico_usb_probe.uf2
+picotool reboot
 # Read /dev/cu.usbmodem* at 115200; expect repeated USB probe heartbeats.
 # Re-enter BOOTSEL, then:
-picotool load -v -x firmware/pico-w/build/pico_w.uf2
+picotool load -v firmware/pico-w/build/pico_w.uf2
+picotool reboot
 ```
 
 `-f` can request software reboot from a responsive SDK USB-stdio image. If it
 fails, use physical BOOTSEL. Do not run concurrent picotool/serial sessions while
 recovering an unresponsive image. A successful flash is not runtime acceptance.
 
+## MicroPython hardware probes
+
+The board is currently on the official MicroPython firmware, with no auto-start
+relay installed. These probes are run from the host, not at power-on:
+
+```sh
+uv run --with mpremote mpremote connect auto run firmware/pico-w/diagnostics/radio_probe.py
+python3 scripts/accept-pico-hr.py --handoff
+```
+
+The second command requires explicit handoff, stops the Mac relay/watchdog for a
+bounded test and restores both in `finally`. Received notifications are queued in
+MicroPython before parsing and durably saved to the Mac telemetry outbox for
+upload. It subscribes to standard HR/RR only and sends no buzzer or alarm commands.
+The tested WHOOP HR service has exactly one trailing CCCD at `HR value + 1`; the
+probe checks that layout before writing. Descriptor discovery on this firmware
+reported the wrong completion event for the singleton range, so this is a
+**device-specific diagnostic**, not a general production GATT client.
+
 ## Always-on relay work still required
 
-1. Prove USB, Wi-Fi and BLE radio runtime, then a controlled WHOOP connection and
-   standard HR/RR subscription. Use a deliberate ownership handoff from the Mac;
-   restore the Mac if any acceptance check fails.
+1. USB, Wi-Fi scanning, BLE scanning and a controlled WHOOP connection are proven
+   with MicroPython. Choose and harden the runtime (fix the C startup or use the
+   MicroPython client), then validate Wi-Fi/BLE coexistence while actually joining
+   the apartment network and uploading. Keep explicit ownership handoff/fallback.
 2. Port framing/CRC, characteristic reassembly, raw telemetry preservation,
    buffered-history ACKs, reconnect/backoff and clock verification. Forward
    batches over verified TLS to a device-authenticated ingest endpoint. Do not
