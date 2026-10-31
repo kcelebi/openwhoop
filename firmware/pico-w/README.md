@@ -102,3 +102,41 @@ leave-and-return backfill with actual interval coverage, two physical sequential
 alarms, edits/toggles, Wi-Fi outage recovery and a cold power cycle. Do not label
 the Pico the active relay until this entire path passes. The mobile layout stays
 unchanged.
+
+## Local 1Password Wi-Fi provisioning
+
+Use the local Mac 1Password account containing the router item. The item title
+can differ from its base station name; specify the **item title** and vault:
+
+```sh
+uv run --with mpremote python scripts/provision-pico-wifi.py \
+  --item 'Apartment router item title' --vault Personal
+```
+
+Approve the local 1Password CLI request if prompted. The helper reads only that
+item, selects its **base station name** and **base station password**, and sends
+them to `wifi.json` on the Pico over USB. It does not print credentials, put them
+in subprocess arguments, create a plaintext Mac credential file, or add them to
+source control. It refuses service-account tokens for this personal Wi-Fi flow.
+The credentials are stored on the Pico filesystem; keep physical access to the
+board controlled. The helper checks that the configured SSID is visible and that
+the board actually associates, rather than treating a saved file as success.
+
+On 2026-10-31 the apartment network association passed with strong signal
+(approximately -45 dBm). The Pico also completed certificate- and
+hostname-verified HTTPS to the personal Supabase host with BLE enabled. The
+expected unauthenticated HTTP 401 confirms reachability, **not** authenticated
+ingestion. No Supabase secret/service-role key was installed on the Pico.
+
+`check-pico-cloud.py` accepts a public DER root certificate from an independently
+verified host TLS chain and requires `CERT_REQUIRED` plus the server hostname.
+It initializes the Pico RTC from the host UTC clock for the test; the production
+relay must obtain trustworthy time on every cold boot before verified TLS.
+
+```sh
+uv run --with mpremote python scripts/check-pico-cloud.py \
+  --host YOUR_PROJECT.supabase.co --ca-file /path/to/verified-root.der
+```
+
+Wi-Fi configuration is persistent, but an auto-start production relay is not yet
+installed. The Mac remains the active relay and analysis worker.
