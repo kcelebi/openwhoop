@@ -599,22 +599,30 @@ impl DatabaseHandler {
         Ok(count)
     }
 
-    pub async fn next_enabled_alarm_unix(&self, now_unix: i64) -> anyhow::Result<Option<i64>> {
-        let row = alarm_schedules::Entity::find()
+    pub async fn next_enabled_alarm_unix(
+        &self,
+        now_unix: i64,
+        cloud_only: bool,
+    ) -> anyhow::Result<Option<i64>> {
+        let mut query = alarm_schedules::Entity::find()
             .filter(alarm_schedules::Column::Enabled.eq(true))
             .filter(alarm_schedules::Column::NextUnix.gte(now_unix))
-            .order_by_asc(alarm_schedules::Column::NextUnix)
-            .one(&self.db)
-            .await?;
+            .order_by_asc(alarm_schedules::Column::NextUnix);
+        if cloud_only {
+            query = query.filter(alarm_schedules::Column::CloudId.is_not_null());
+        }
+        let row = query.one(&self.db).await?;
         Ok(row.and_then(|r| r.next_unix))
     }
 
-    pub async fn mark_alarm_programmed(&self, unix: i64) -> anyhow::Result<()> {
-        let rows = alarm_schedules::Entity::find()
+    pub async fn mark_alarm_programmed(&self, unix: i64, cloud_only: bool) -> anyhow::Result<()> {
+        let mut query = alarm_schedules::Entity::find()
             .filter(alarm_schedules::Column::Enabled.eq(true))
-            .filter(alarm_schedules::Column::NextUnix.eq(unix))
-            .all(&self.db)
-            .await?;
+            .filter(alarm_schedules::Column::NextUnix.eq(unix));
+        if cloud_only {
+            query = query.filter(alarm_schedules::Column::CloudId.is_not_null());
+        }
+        let rows = query.all(&self.db).await?;
         for mut row in rows {
             row.last_sent_unix = Some(Utc::now().timestamp());
             row.updated_at = Utc::now().naive_utc();
@@ -987,7 +995,7 @@ mod tests {
         assert!(!stored.enabled);
         assert_eq!(stored.last_missed_unix, Some(now - 60));
         assert_eq!(stored.last_rang_unix, None);
-        assert_eq!(db.next_enabled_alarm_unix(now).await.unwrap(), None);
+        assert_eq!(db.next_enabled_alarm_unix(now, false).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1085,5 +1093,41 @@ mod tests {
         );
         db.reconcile_cloud_alarms(&[]).await.unwrap();
         assert!(db.list_alarm_schedules().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cloud_mode_ignores_local_alarms_even_when_they_are_earlier() {
+        let db = DatabaseHandler::new("sqlite::memory:").await;
+        let now = Utc::now().timestamp();
+        db.create_alarm_schedule(AlarmScheduleDraft {
+            label: "old local alarm".into(),
+            kind: "once".into(),
+            cron_expr: None,
+            timezone: Some("America/New_York".into()),
+            one_time_unix: Some(now + 600),
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.next_enabled_alarm_unix(now, true).await.unwrap(), None);
+        assert_eq!(
+            db.next_enabled_alarm_unix(now, false).await.unwrap(),
+            Some(now + 600)
+        );
+
+        db.reconcile_cloud_alarms(&[CloudAlarmInput {
+            id: Uuid::new_v4(),
+            label: "dashboard alarm".into(),
+            kind: "once".into(),
+            cron_expr: None,
+            timezone: "America/New_York".into(),
+            one_time_unix: Some(now + 1200),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        assert_eq!(
+            db.next_enabled_alarm_unix(now, true).await.unwrap(),
+            Some(now + 1200)
+        );
     }
 }

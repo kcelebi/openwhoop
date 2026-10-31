@@ -623,6 +623,11 @@ impl OpenWhoopCli {
                 }
             }
             OpenWhoopCommand::LiveServer { whoop, port } => {
+                let history_sync = std::env::var("OPENWHOOP_HISTORY_SYNC")
+                    .map(|value| {
+                        !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off")
+                    })
+                    .unwrap_or(true);
                 let (live_tx, _) = broadcast::channel::<String>(512);
                 let live_hr_snapshot = Arc::new(Mutex::new(None::<String>));
                 let strap_alarm_state = Arc::new(Mutex::new(None::<Option<i64>>));
@@ -641,7 +646,9 @@ impl OpenWhoopCli {
                     last_hr_json: live_hr_snapshot.clone(),
                     job_tx: job_tx.clone(),
                 };
-                let cloud_task = cloud_relay::CloudConfig::from_env()?.map(|cfg| {
+                let cloud_config = cloud_relay::CloudConfig::from_env()?;
+                let cloud_only_alarms = cloud_config.is_some();
+                let cloud_task = cloud_config.map(|cfg| {
                     tokio::spawn(cloud_relay::run(
                         cfg,
                         db_handler.clone(),
@@ -658,6 +665,7 @@ impl OpenWhoopCli {
                     should_exit.clone(),
                     force_alarm_recheck,
                     strap_alarm_state,
+                    cloud_only_alarms,
                 ));
                 let _server = tokio::spawn(async move {
                     if let Err(e) = live_server::run(app_state, port).await {
@@ -762,6 +770,7 @@ impl OpenWhoopCli {
                             &mut job_rx,
                             &mut tracker,
                             scan_cycle,
+                            history_sync,
                         )
                         .await;
                     session_seq = tracker.state_seq;

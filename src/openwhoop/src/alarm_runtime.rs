@@ -62,6 +62,7 @@ pub async fn run(
     exit: Arc<AtomicBool>,
     force_recheck: Arc<AtomicBool>,
     strap_state: Arc<Mutex<Option<Option<i64>>>>,
+    cloud_only: bool,
 ) {
     let mut tick = interval(RECHECK_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -73,7 +74,9 @@ pub async fn run(
         let result: anyhow::Result<()> = async {
             db.expire_past_alarm_schedules(now - LATE_GRACE_SECS)
                 .await?;
-            let desired = db.next_enabled_alarm_unix(now - LATE_GRACE_SECS).await?;
+            let desired = db
+                .next_enabled_alarm_unix(now - LATE_GRACE_SECS, cloud_only)
+                .await?;
             if !force_recheck.swap(false, Ordering::SeqCst)
                 && last_verified == Some(desired)
                 && now - last_readback_unix < READBACK_INTERVAL_SECS
@@ -84,7 +87,7 @@ pub async fn run(
             let current = get_strap_alarm(&jobs).await?;
             // A dashboard edit may have happened while the BLE read was pending.
             let desired = db
-                .next_enabled_alarm_unix(Utc::now().timestamp() - LATE_GRACE_SECS)
+                .next_enabled_alarm_unix(Utc::now().timestamp() - LATE_GRACE_SECS, cloud_only)
                 .await?;
             if current != desired {
                 // Never send an alarm timestamp that is already due or too close to verify.
@@ -99,7 +102,7 @@ pub async fn run(
                 );
             }
             if let Some(unix) = desired {
-                db.mark_alarm_programmed(unix).await?;
+                db.mark_alarm_programmed(unix, cloud_only).await?;
             }
             last_verified = Some(desired);
             if let Ok(mut state) = strap_state.lock() {
