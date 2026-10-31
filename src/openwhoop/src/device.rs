@@ -6,7 +6,7 @@ use btleplug::{
 use chrono::Utc;
 use futures::StreamExt;
 use openwhoop_codec::{
-    WhoopData, WhoopPacket,
+    HistoryReading, WhoopData, WhoopPacket,
     constants::{
         CMD_FROM_STRAP, CMD_TO_STRAP, CommandNumber, DATA_FROM_STRAP, EVENTS_FROM_STRAP, MEMFAULT,
         PacketType, WHOOP_SERVICE,
@@ -27,6 +27,18 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 use crate::{StudioDeviceJob, db::DatabaseHandler, openwhoop::OpenWhoop};
+
+const HEART_RATE_MEASUREMENT: Uuid = Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb);
+
+fn standard_heart_rate_bpm(bytes: &[u8]) -> Option<u8> {
+    let flags = *bytes.first()?;
+    let raw = if flags & 1 == 0 {
+        u16::from(*bytes.get(1)?)
+    } else {
+        u16::from_le_bytes([*bytes.get(1)?, *bytes.get(2)?])
+    };
+    (raw > 0 && raw <= 250).then_some(raw as u8)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionState {
@@ -80,6 +92,14 @@ enum StudioPending {
         gatt_percent: Option<u8>,
     },
     AlarmRead(oneshot::Sender<Result<serde_json::Value, String>>),
+}
+
+impl StudioPending {
+    fn receiver_closed(&self) -> bool {
+        match self {
+            Self::Battery { reply, .. } | Self::AlarmRead(reply) => reply.is_closed(),
+        }
+    }
 }
 
 pub struct WhoopDevice {
@@ -216,6 +236,20 @@ impl WhoopDevice {
         self.subscribe(EVENTS_FROM_STRAP).await?;
         self.subscribe(MEMFAULT).await?;
 
+        if let Some(hr_char) = self
+            .peripheral
+            .characteristics()
+            .into_iter()
+            .find(|c| c.uuid == HEART_RATE_MEASUREMENT)
+        {
+            match self.peripheral.subscribe(&hr_char).await {
+                Ok(()) => info!("Subscribed to standard live heart-rate measurement"),
+                Err(error) => warn!("Live heart-rate subscription unavailable: {error}"),
+            }
+        } else {
+            warn!("Standard heart-rate measurement not exposed by this strap");
+        }
+
         self.send_command(WhoopPacket::hello_harvard()).await?;
         self.send_command(WhoopPacket::set_time()?).await?;
         self.send_command(WhoopPacket::get_name()).await?;
@@ -332,9 +366,26 @@ impl WhoopDevice {
 
             tokio::select! {
                 biased;
+                // Control jobs must not starve behind a large historical-data burst.
+                Some(job) = jobs.recv() => {
+                    self.handle_studio_job(job).await?;
+                }
                 Some(notification) = notification => {
                     self.last_notification_at = Some(Instant::now());
                     rx_count += 1;
+                    if notification.uuid == HEART_RATE_MEASUREMENT {
+                        if let Some(bpm) = standard_heart_rate_bpm(&notification.value) {
+                            self.whoop.record_live_heart_rate(HistoryReading {
+                                unix: u64::try_from(Utc::now().timestamp_millis())?,
+                                bpm,
+                                rr: Vec::new(),
+                                imu_data: Vec::new(),
+                                sensor_data: None,
+                            }).await?;
+                            self.emit_session_state(tracker, SessionState::Live, "standard_hr_measurement");
+                        }
+                        continue;
+                    }
                     let len = notification.value.len();
                     if rx_count <= 8 || rx_count % 200 == 0 {
                         info!(
@@ -367,9 +418,6 @@ impl WhoopDevice {
                         );
                         tracker.live_probe_streak = 0;
                     }
-                }
-                Some(job) = jobs.recv() => {
-                    self.handle_studio_job(job).await?;
                 }
                 _ = sleep_ => {
                     self.emit_connection_health(0, scan_cycle);
@@ -535,6 +583,13 @@ impl WhoopDevice {
                 self.send_command(WhoopPacket::get_battery_level()).await?;
             }
             StudioDeviceJob::GetAlarm { reply } => {
+                if self
+                    .studio_pending
+                    .as_ref()
+                    .is_some_and(StudioPending::receiver_closed)
+                {
+                    self.studio_pending = None;
+                }
                 if self.studio_pending.is_some() {
                     let _ = reply.send(Err("device busy (another request in flight)".into()));
                     return Ok(());
@@ -674,7 +729,16 @@ impl WhoopDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionState, WhoopDevice};
+    use super::{SessionState, WhoopDevice, standard_heart_rate_bpm};
+
+    #[test]
+    fn standard_heart_rate_measurement_supports_8_and_16_bit_values() {
+        assert_eq!(standard_heart_rate_bpm(&[0x00, 73]), Some(73));
+        assert_eq!(standard_heart_rate_bpm(&[0x01, 88, 0]), Some(88));
+        assert_eq!(standard_heart_rate_bpm(&[0x01, 88]), None);
+        assert_eq!(standard_heart_rate_bpm(&[0x00, 0]), None);
+        assert_eq!(standard_heart_rate_bpm(&[0x01, 0xff, 0x00]), None);
+    }
 
     #[test]
     fn battery_resolver_prefers_ble_when_disagreeing() {

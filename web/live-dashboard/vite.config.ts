@@ -40,11 +40,13 @@ const logger = {
 };
 
 export default defineConfig({
+  base: process.env.GITHUB_PAGES === "true" ? "/openwhoop/" : "/",
   customLogger: logger,
   plugins: [react()],
   server: {
-    // Bind IPv4 so tools that probe 127.0.0.1 (Playwright webServer, Rust live-server) match `localhost`.
-    host: "127.0.0.1",
+    // Bind all interfaces so a phone on the same LAN can reach the dev server
+    // (Milestone 1: "clean URL" for local mobile check via Mac as relay node).
+    host: "0.0.0.0",
     port: 5173,
     proxy: {
       // Use http + ws:true so the dev server performs a proper Upgrade; ws:// targets often break.

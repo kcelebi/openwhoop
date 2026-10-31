@@ -2,8 +2,12 @@
 .venv/
 .pgdata/
 .env
+.env.cloud
+/supabase/.temp/
 db.sqlite
 db.sqlite-journal
-/firmware
+/firmware/pico-w/build/
 web/live-dashboard/node_modules/
 web/live-dashboard/dist/
+/web/live-dashboard/test-results/
+/web/live-dashboard/playwright-report/

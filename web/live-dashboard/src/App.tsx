@@ -83,6 +83,9 @@ const STUDIO_ORIGIN =
     /\/$/,
     "",
   ) ?? "";
+const USE_REST_LIVE =
+  (import.meta.env.VITE_LIVE_TRANSPORT as string | undefined) === "rest" ||
+  Boolean(STUDIO_ORIGIN);
 
 function resolveApiUrl(path: string): string {
   if (!path.startsWith("/") || !STUDIO_ORIGIN) return path;
@@ -221,9 +224,13 @@ type AlarmItem = {
   label: string;
   kind: "cron" | "once" | string;
   cron_expr?: string | null;
+  timezone?: string;
   one_time_unix?: number | null;
   next_unix?: number | null;
   last_rang_unix?: number | null;
+  last_missed_unix?: number | null;
+  last_unconfirmed_unix?: number | null;
+  last_sent_unix?: number | null;
   enabled: boolean;
 };
 
@@ -276,14 +283,11 @@ function hrChartTooltipLabel(v: number): string {
   });
 }
 
-function HrScatterDot(props: {
-  cx?: number;
-  cy?: number;
-  fill?: string;
-  fillOpacity?: number;
-}) {
-  const { cx, cy, fill, fillOpacity } = props;
-  if (cx == null || cy == null) return null;
+function HrScatterDot(props: unknown) {
+  const { cx, cy, fill, fillOpacity } = props as {
+    cx?: number; cy?: number; fill?: string; fillOpacity?: number;
+  };
+  if (cx == null || cy == null) return <g />;
   return (
     <circle
       cx={cx}
@@ -381,6 +385,7 @@ export default function App() {
   const [sessionState, setSessionState] = useState<SessionStateMsg | null>(null);
   const [lastLagMs, setLastLagMs] = useState<number | null>(null);
   const [lastHr, setLastHr] = useState<HeartRateMsg | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [pulseSeries, setPulseSeries] = useState<HrPoint[]>([]);
   const [lastBattery, setLastBattery] = useState<{
     percent: number | null;
@@ -450,6 +455,8 @@ export default function App() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const hrQueueRef = useRef<HrPoint[]>([]);
+  const lastPolledHrMsRef = useRef<number | null>(null);
+  const livePollInFlightRef = useRef(false);
   const drainRafRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -588,6 +595,43 @@ export default function App() {
     }
   }, []);
 
+  // T3: REST-polling live BPM for the Pulse tab (Milestone 1 transport decision).
+  const refreshLiveBpm = useCallback(async () => {
+    if (livePollInFlightRef.current) return;
+    livePollInFlightRef.current = true;
+    try {
+      const since = lastPolledHrMsRef.current;
+      const query = since == null ? "range=1h&limit=120" : `since_ms=${since}&limit=120`;
+      const j = (await api(
+        `/api/insights/heart-rate-series?${query}`,
+      )) as { points?: HrPoint[] };
+      const pts = (Array.isArray(j.points) ? j.points : [])
+        .filter((p) => Number.isFinite(p.t_ms) && Number.isFinite(p.bpm))
+        .filter((p) => since == null || p.t_ms > since)
+        .sort((a, b) => a.t_ms - b.t_ms);
+      if (pts.length > 0) {
+        const last = pts[pts.length - 1]!;
+        lastPolledHrMsRef.current = last.t_ms;
+        setLastHr({
+          type: "heart_rate",
+          unix_ms: last.t_ms,
+          bpm: last.bpm,
+          time_local: new Date(last.t_ms).toLocaleString(),
+          rr_count: 0,
+          received_at_ms: Date.now(),
+        });
+        hrQueueRef.current.push(...pts);
+        schedulePulseDrain();
+      }
+      setWsState("open");
+    } catch (error) {
+      setWsState("closed");
+      throw error;
+    } finally {
+      livePollInFlightRef.current = false;
+    }
+  }, [schedulePulseDrain]);
+
   useEffect(() => {
     if (tab !== "trends") return;
     void loadHeartSeries(hrRange);
@@ -603,9 +647,25 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [tab, autoRefreshInsights, refreshInsights, loadHeartSeries, hrRange]);
 
+  // T3: poll live BPM from the REST backend while the Pulse tab is mounted.
   useEffect(() => {
+    if (tab !== "pulse" || !USE_REST_LIVE) return;
+    void refreshLiveBpm().catch(() => {});
+    const id = window.setInterval(() => {
+      void refreshLiveBpm().catch(() => {});
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [tab, refreshLiveBpm]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (USE_REST_LIVE) return;
     let cancelled = false;
-    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let reconnectTimer: number | undefined;
     let attempt = 0;
     let everOpened = false;
 
@@ -754,22 +814,30 @@ export default function App() {
 
   useEffect(() => {
     if (tab !== "alarms") return;
-    void runApi("alarm-read", async () => {
+    void loadAlarmSchedules();
+    const refreshStrap = async () => {
       const j = (await api("/api/device/alarm")) as {
         enabled?: boolean;
         unix?: number;
       };
       setStrapAlarm({ enabled: j.enabled, unix: j.unix });
-      await loadAlarmSchedules();
-    }).catch(() => {});
-  }, [tab, runApi, loadAlarmSchedules]);
+    };
+    void refreshStrap().catch(() => setStrapAlarm(null));
+    const id = window.setInterval(() => {
+      void loadAlarmSchedules();
+      void refreshStrap().catch(() => setStrapAlarm(null));
+    }, 10_000);
+    return () => window.clearInterval(id);
+  }, [tab, loadAlarmSchedules]);
 
   const lastReceivedAgeMs =
     lastHr?.received_at_ms != null
-      ? Date.now() - lastHr.received_at_ms
+      ? nowMs - lastHr.received_at_ms
       : null;
+  const sampleAgeMs = lastHr != null ? nowMs - lastHr.unix_ms : null;
   const streamSampleRecent =
-    lastReceivedAgeMs != null && lastReceivedAgeMs < LIVE_SAMPLE_MAX_AGE_MS;
+    lastReceivedAgeMs != null && lastReceivedAgeMs < LIVE_SAMPLE_MAX_AGE_MS &&
+    sampleAgeMs != null && sampleAgeMs >= -5_000 && sampleAgeMs < LIVE_SAMPLE_MAX_AGE_MS;
   const lagBasedSyncing =
     lastLagMs != null
       ? lastLagMs > SYNCING_LAG_MS
@@ -779,7 +847,9 @@ export default function App() {
       ? wsLabel(wsState)
       : lagBasedSyncing
         ? "Syncing"
-        : "Live";
+        : streamSampleRecent
+          ? "Live"
+          : "Stale";
   const showLivePill =
     lastHr != null &&
     !lagBasedSyncing &&
@@ -1436,8 +1506,8 @@ export default function App() {
               Alarms
             </h2>
             <p style={{ margin: "0 0 1rem", fontSize: "0.88rem", color: "var(--muted)" }}>
-              Configure multiple cron or one-time alarms. Scheduler keeps the next upcoming alarm
-              programmed on the strap while it is in range.
+              Configure multiple alarms. The Mac keeps the next enabled alarm programmed on the
+              strap while it is connected. Check the strap status below before relying on it.
             </p>
             {strapAlarm != null ? (
               <div
@@ -1461,7 +1531,7 @@ export default function App() {
                 ) : null}
               </div>
             ) : (
-              <p style={{ color: "var(--muted)", fontSize: "0.85rem" }}>Loading…</p>
+              <p style={{ color: "var(--warn)", fontSize: "0.85rem" }}>Strap status unavailable. Saved alarms may be pending.</p>
             )}
           </div>
 
@@ -1556,6 +1626,7 @@ export default function App() {
                         ? {
                             label: alarmLabel.trim(),
                             kind: "once",
+                            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
                             one_time_unix: Math.floor(
                               new Date(alarmLocal).getTime() / 1000,
                             ),
@@ -1564,18 +1635,14 @@ export default function App() {
                             label: alarmLabel.trim(),
                             kind: "cron",
                             cron_expr: alarmCronExpr.trim(),
+                            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
                           };
                     await api("/api/alarms", {
                       method: "POST",
                       body: JSON.stringify(body),
                     });
                     await loadAlarmSchedules();
-                    const st = (await api("/api/device/alarm")) as {
-                      enabled?: boolean;
-                      unix?: number;
-                    };
-                    setStrapAlarm({ enabled: st.enabled, unix: st.unix });
-                    setDeviceNote("Alarm saved. Scheduler will program the next trigger.");
+                    setDeviceNote("Alarm saved. Waiting for Mac and strap confirmation.");
                   })
                 }
               >
@@ -1583,7 +1650,7 @@ export default function App() {
               </button>
             </div>
             <p style={{ margin: "0.6rem 0 0", color: "var(--muted)", fontSize: "0.8rem" }}>
-              Cron uses standard 5-field format in local time.
+              Cron uses standard 5-field format in {Intl.DateTimeFormat().resolvedOptions().timeZone}.
             </p>
           </div>
 
@@ -1647,7 +1714,7 @@ export default function App() {
                     </div>
                     <div style={{ fontSize: "0.78rem", color: "var(--muted)" }}>
                       {a.kind === "cron" && a.cron_expr
-                        ? `cron: ${a.cron_expr}`
+                        ? `cron: ${a.cron_expr} · ${a.timezone ?? "UTC"}`
                         : a.one_time_unix
                           ? `one-time: ${new Date(a.one_time_unix * 1000).toLocaleString()}`
                           : "—"}
@@ -1662,10 +1729,21 @@ export default function App() {
                         ? new Date(a.last_rang_unix * 1000).toLocaleString()
                         : "—"}
                     </div>
+                    <div style={{ fontSize: "0.78rem", color: a.enabled && a.next_unix === strapAlarm?.unix && strapAlarm?.enabled ? "var(--accent)" : "var(--warn)" }}>
+                      {a.enabled
+                        ? a.next_unix === strapAlarm?.unix && strapAlarm?.enabled
+                          ? "Confirmed on strap"
+                          : "Pending strap confirmation"
+                        : "Off"}
+                      {a.last_missed_unix != null ? ` · Last missed: ${new Date(a.last_missed_unix * 1000).toLocaleString()}` : ""}
+                      {a.last_unconfirmed_unix != null ? ` · Last occurrence unconfirmed by telemetry: ${new Date(a.last_unconfirmed_unix * 1000).toLocaleString()}` : ""}
+                    </div>
                   </div>
                   <div style={{ display: "flex", gap: "0.45rem" }}>
                     <button
                       type="button"
+                      disabled={apiBusy}
+                      aria-pressed={a.enabled}
                       style={tabBtn(a.enabled)}
                       onClick={() =>
                         void runApi("toggle-alarm", async () => {
@@ -1674,6 +1752,8 @@ export default function App() {
                             body: JSON.stringify({ enabled: !a.enabled }),
                           });
                           await loadAlarmSchedules();
+                          setStrapAlarm(null);
+                          setDeviceNote("Alarm updated. Waiting for strap confirmation.");
                         })
                       }
                     >
@@ -1681,6 +1761,7 @@ export default function App() {
                     </button>
                     <button
                       type="button"
+                      disabled={apiBusy}
                       style={tabBtn(false)}
                       onClick={() =>
                         void runApi("delete-alarm", async () => {

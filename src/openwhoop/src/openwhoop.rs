@@ -36,6 +36,38 @@ pub struct OpenWhoop {
 }
 
 impl OpenWhoop {
+    pub async fn record_live_heart_rate(&mut self, reading: HistoryReading) -> anyhow::Result<()> {
+        let received_at_ms = Utc::now().timestamp_millis();
+        let time_local = DateTime::from_timestamp_millis(i64::try_from(reading.unix)?)
+            .ok_or_else(|| anyhow::anyhow!("invalid live heart-rate timestamp"))?
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let payload = serde_json::json!({
+            "type": "heart_rate", "source": "gatt_live",
+            "unix_ms": reading.unix, "bpm": reading.bpm,
+            "time_local": time_local, "rr_count": reading.rr.len(),
+            "received_at_ms": received_at_ms,
+        });
+        let line = payload.to_string();
+        if let Some(snapshot) = self.live_hr_snapshot.as_ref() {
+            if let Ok(mut slot) = snapshot.lock() {
+                *slot = Some(line.clone());
+            }
+        }
+        if let Some(tx) = self.live_tx.as_ref() {
+            let _ = tx.send(line);
+        }
+        self.last_sample_unix_ms = Some(reading.unix);
+        self.last_sample_received_ms = Some(received_at_ms);
+        let recorded_at_ms = i64::try_from(reading.unix)?;
+        let bpm = reading.bpm;
+        self.database.create_reading(reading).await?;
+        self.database
+            .enqueue_cloud_hr_sample(recorded_at_ms, bpm, received_at_ms)
+            .await?;
+        Ok(())
+    }
     pub fn new(database: DatabaseHandler) -> Self {
         Self {
             database,
@@ -200,7 +232,10 @@ impl OpenWhoop {
 
                 // Dashboard WebSocket: emit every valid sample so Pulse can plot catch-up in real time
                 // and the right-hand readout updates as data arrives.
-                if let Some(tx) = self.live_tx.as_ref() {
+                let live_sample_recent = self.last_sample_unix_ms.is_some_and(|last| {
+                    last > u64::try_from(Utc::now().timestamp_millis() - 60_000).unwrap_or(0)
+                });
+                if let Some(tx) = self.live_tx.as_ref().filter(|_| !live_sample_recent) {
                     let received_at_ms = Utc::now().timestamp_millis();
                     let payload = serde_json::json!({
                         "type": "heart_rate",
@@ -221,8 +256,10 @@ impl OpenWhoop {
                     }
                     let _ = tx.send(line);
                 }
-                self.last_sample_unix_ms = Some(hr.unix);
-                self.last_sample_received_ms = Some(Utc::now().timestamp_millis());
+                if !live_sample_recent {
+                    self.last_sample_unix_ms = Some(hr.unix);
+                    self.last_sample_received_ms = Some(Utc::now().timestamp_millis());
+                }
 
                 if let Some(last_packet) = self.last_history_packet.as_mut() {
                     if last_packet.unix == hr.unix && last_packet.bpm == hr.bpm {
@@ -235,9 +272,9 @@ impl OpenWhoop {
                 }
 
                 if hr.imu_data.is_empty() {
-                    info!("HistoryReading time: {}", ptime);
+                    debug!("HistoryReading time: {}", ptime);
                 } else {
-                    info!("HistoryReading time: {} (IMU)", ptime);
+                    debug!("HistoryReading time: {} (IMU)", ptime);
                 }
 
                 self.history_packets.push(hr);

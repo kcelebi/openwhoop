@@ -195,6 +195,7 @@ impl WhoopPacket {
             PacketType::Command,
             0,
             CommandNumber::RunHapticsPattern.as_u8(),
+            // This payload physically buzzed the user's WHOOP 4; preset tables vary by firmware.
             vec![0x01, 0x01, 0x01, 0x00, 0x00],
         )
     }
@@ -204,8 +205,19 @@ impl WhoopPacket {
             PacketType::Command,
             0,
             CommandNumber::StopHaptics.as_u8(),
-            vec![],
+            vec![0x00],
         )
+    }
+}
+
+#[cfg(test)]
+mod haptics_tests {
+    use super::*;
+
+    #[test]
+    fn haptic_packets_use_verified_start_and_documented_stop() {
+        assert_eq!(WhoopPacket::buzzer().data, [1, 1, 1, 0, 0]);
+        assert_eq!(WhoopPacket::stop_buzzer().data, [0]);
     }
 }
 

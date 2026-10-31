@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use chrono::{Local, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use cron::Schedule;
-use openwhoop_entities::{alarm_schedules, command_queue, packets, sleep_cycles};
+use openwhoop_entities::{alarm_schedules, cloud_hr_outbox, command_queue, packets, sleep_cycles};
 use openwhoop_migration::{Migrator, MigratorTrait, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, ConnectOptions, Database,
@@ -25,6 +26,7 @@ pub struct AlarmScheduleDraft {
     /// `cron` or `once`
     pub kind: String,
     pub cron_expr: Option<String>,
+    pub timezone: Option<String>,
     pub one_time_unix: Option<i64>,
 }
 
@@ -32,6 +34,17 @@ pub struct AlarmScheduleDraft {
 pub struct AlarmSchedulePatch {
     pub label: Option<String>,
     pub enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CloudAlarmInput {
+    pub id: Uuid,
+    pub label: String,
+    pub kind: String,
+    pub cron_expr: Option<String>,
+    pub timezone: String,
+    pub one_time_unix: Option<i64>,
+    pub enabled: bool,
 }
 
 impl DatabaseHandler {
@@ -103,6 +116,60 @@ impl DatabaseHandler {
             .exec(&self.db)
             .await?;
 
+        Ok(())
+    }
+
+    pub async fn enqueue_cloud_hr_sample(
+        &self,
+        recorded_at_ms: i64,
+        bpm: u8,
+        received_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let row = cloud_hr_outbox::ActiveModel {
+            recorded_at_ms: Set(recorded_at_ms),
+            bpm: Set(i16::from(bpm)),
+            received_at_ms: Set(received_at_ms),
+            synced: Set(false),
+        };
+        cloud_hr_outbox::Entity::insert(row)
+            .on_conflict(
+                OnConflict::column(cloud_hr_outbox::Column::RecordedAtMs)
+                    .update_columns([
+                        cloud_hr_outbox::Column::Bpm,
+                        cloud_hr_outbox::Column::ReceivedAtMs,
+                        cloud_hr_outbox::Column::Synced,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn pending_cloud_hr_samples(
+        &self,
+        limit: u64,
+    ) -> anyhow::Result<Vec<cloud_hr_outbox::Model>> {
+        Ok(cloud_hr_outbox::Entity::find()
+            .filter(cloud_hr_outbox::Column::Synced.eq(false))
+            .order_by_asc(cloud_hr_outbox::Column::RecordedAtMs)
+            .limit(limit.clamp(1, 500))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn mark_cloud_hr_synced(&self, timestamps: &[i64]) -> anyhow::Result<()> {
+        if timestamps.is_empty() {
+            return Ok(());
+        }
+        cloud_hr_outbox::Entity::update_many()
+            .col_expr(
+                cloud_hr_outbox::Column::Synced,
+                sea_orm::sea_query::Expr::value(true),
+            )
+            .filter(cloud_hr_outbox::Column::RecordedAtMs.is_in(timestamps.iter().copied()))
+            .exec(&self.db)
+            .await?;
         Ok(())
     }
 
@@ -229,6 +296,102 @@ impl DatabaseHandler {
         Ok(items)
     }
 
+    /// Supabase owns hosted alarm edits. Preserve local delivery evidence while applying them.
+    pub async fn reconcile_cloud_alarms(&self, incoming: &[CloudAlarmInput]) -> anyhow::Result<()> {
+        let existing = self.list_alarm_schedules().await?;
+        let incoming_ids: std::collections::HashSet<Uuid> = incoming.iter().map(|a| a.id).collect();
+        for row in &existing {
+            if row.cloud_id.is_some_and(|id| !incoming_ids.contains(&id)) {
+                self.delete_alarm_schedule(row.id).await?;
+            }
+        }
+        let now = Utc::now().timestamp();
+        for input in incoming {
+            let _: Tz = input
+                .timezone
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid timezone"))?;
+            let next = match input.kind.as_str() {
+                "once" => input.one_time_unix.filter(|unix| *unix > now),
+                "cron" => next_from_cron(
+                    input
+                        .cron_expr
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("missing cron"))?,
+                    now,
+                    &input.timezone,
+                )?,
+                _ => anyhow::bail!("invalid cloud alarm kind"),
+            };
+            if let Some(mut row) = existing
+                .iter()
+                .find(|r| r.cloud_id == Some(input.id))
+                .cloned()
+            {
+                let changed = row.label != input.label
+                    || row.kind != input.kind
+                    || row.cron_expr != input.cron_expr
+                    || row.timezone != input.timezone
+                    || row.one_time_unix != input.one_time_unix;
+                row.label = input.label.clone();
+                row.kind = input.kind.clone();
+                row.cron_expr = input.cron_expr.clone();
+                row.timezone = input.timezone.clone();
+                row.one_time_unix = input.one_time_unix;
+                row.enabled = input.enabled && next.is_some();
+                if changed || (row.enabled && row.next_unix.is_none()) {
+                    row.next_unix = next;
+                    row.last_sent_unix = None;
+                }
+                if !row.enabled {
+                    row.next_unix = None;
+                    row.last_sent_unix = None;
+                }
+                row.updated_at = Utc::now().naive_utc();
+                self.save_alarm_schedule(row).await?;
+            } else if next.is_some() {
+                let mut row = self
+                    .create_alarm_schedule(AlarmScheduleDraft {
+                        label: input.label.clone(),
+                        kind: input.kind.clone(),
+                        cron_expr: input.cron_expr.clone(),
+                        timezone: Some(input.timezone.clone()),
+                        one_time_unix: input.one_time_unix,
+                    })
+                    .await?;
+                row.cloud_id = Some(input.id);
+                row.enabled = input.enabled;
+                if !row.enabled {
+                    row.next_unix = None;
+                }
+                self.save_alarm_schedule(row).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn save_alarm_schedule(
+        &self,
+        row: alarm_schedules::Model,
+    ) -> anyhow::Result<alarm_schedules::Model> {
+        // Converting a fetched Model produces Unchanged values. Explicit Set values are
+        // required or SeaORM silently leaves enabled/next_unix/last_rang untouched.
+        let mut am: alarm_schedules::ActiveModel = row.clone().into();
+        am.label = Set(row.label);
+        am.cloud_id = Set(row.cloud_id);
+        am.cron_expr = Set(row.cron_expr);
+        am.timezone = Set(row.timezone);
+        am.one_time_unix = Set(row.one_time_unix);
+        am.next_unix = Set(row.next_unix);
+        am.last_rang_unix = Set(row.last_rang_unix);
+        am.last_missed_unix = Set(row.last_missed_unix);
+        am.last_unconfirmed_unix = Set(row.last_unconfirmed_unix);
+        am.last_sent_unix = Set(row.last_sent_unix);
+        am.enabled = Set(row.enabled);
+        am.updated_at = Set(row.updated_at);
+        Ok(am.update(&self.db).await?)
+    }
+
     pub async fn create_alarm_schedule(
         &self,
         draft: AlarmScheduleDraft,
@@ -236,29 +399,40 @@ impl DatabaseHandler {
         let now = Utc::now().naive_utc();
         let now_unix = Utc::now().timestamp();
         let kind = draft.kind.to_lowercase();
+        let timezone = draft.timezone.unwrap_or_else(|| "UTC".to_string());
+        let _: Tz = timezone
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid IANA timezone: {timezone}"))?;
         let next_unix = match kind.as_str() {
             "cron" => {
                 let expr = draft
                     .cron_expr
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("cron_expr is required for cron schedules"))?;
-                next_from_cron(expr, now_unix)?
+                next_from_cron(expr, now_unix, &timezone)?
             }
-            "once" => draft
-                .one_time_unix
-                .ok_or_else(|| anyhow::anyhow!("one_time_unix is required for once schedules"))
-                .map(Some)?,
+            "once" => {
+                let unix = draft.one_time_unix.ok_or_else(|| {
+                    anyhow::anyhow!("one_time_unix is required for once schedules")
+                })?;
+                anyhow::ensure!(unix > now_unix, "one-time alarm must be in the future");
+                Some(unix)
+            }
             _ => return Err(anyhow::anyhow!("kind must be `cron` or `once`")),
         };
 
         let model = alarm_schedules::ActiveModel {
             id: NotSet,
+            cloud_id: Set(None),
             label: Set(draft.label),
             kind: Set(kind),
             cron_expr: Set(draft.cron_expr),
+            timezone: Set(timezone),
             one_time_unix: Set(draft.one_time_unix),
             next_unix: Set(next_unix),
             last_rang_unix: Set(None),
+            last_missed_unix: Set(None),
+            last_unconfirmed_unix: Set(None),
             last_sent_unix: Set(None),
             enabled: Set(true),
             created_at: Set(now),
@@ -283,10 +457,28 @@ impl DatabaseHandler {
         }
         if let Some(enabled) = patch.enabled {
             row.enabled = enabled;
+            if !enabled {
+                row.last_sent_unix = None;
+            }
+            if enabled {
+                let now = Utc::now().timestamp();
+                if row.next_unix.is_none_or(|next| next <= now) {
+                    row.next_unix = match row.kind.as_str() {
+                        "cron" => row
+                            .cron_expr
+                            .as_deref()
+                            .map(|expr| next_from_cron(expr, now, &row.timezone))
+                            .transpose()?
+                            .flatten(),
+                        "once" => row.one_time_unix.filter(|unix| *unix > now),
+                        _ => None,
+                    };
+                    anyhow::ensure!(row.next_unix.is_some(), "alarm has no future occurrence");
+                }
+            }
         }
         row.updated_at = Utc::now().naive_utc();
-        let am: alarm_schedules::ActiveModel = row.into();
-        let updated = am.update(&self.db).await?;
+        let updated = self.save_alarm_schedule(row).await?;
         Ok(Some(updated))
     }
 
@@ -323,53 +515,88 @@ impl DatabaseHandler {
                 }
                 "cron" => {
                     if let Some(expr) = s.cron_expr.as_ref() {
-                        next_from_cron(expr, now_unix + 1)?
+                        next_from_cron(expr, now_unix, &s.timezone)?
                     } else {
                         None
                     }
                 }
                 _ => None,
             };
+            s.last_sent_unix = None;
             s.updated_at = Utc::now().naive_utc();
-            let am: alarm_schedules::ActiveModel = s.into();
-            let _ = am.update(&self.db).await?;
+            self.save_alarm_schedule(s).await?;
         }
         Ok(triggered)
     }
 
-    /// Update schedule row(s) when strap alarm fired.
+    /// Update the one closest matching schedule when the strap reports an alarm.
     pub async fn mark_alarm_rang(&self, strap_unix: i64) -> anyhow::Result<()> {
         let now = Utc::now().timestamp();
         let candidates = alarm_schedules::Entity::find()
             .filter(alarm_schedules::Column::Enabled.eq(true))
+            .filter(alarm_schedules::Column::NextUnix.gte(strap_unix - 90))
             .filter(alarm_schedules::Column::NextUnix.lte(strap_unix + 90))
-            .order_by_desc(alarm_schedules::Column::NextUnix)
             .all(&self.db)
             .await?;
-        if candidates.is_empty() {
+        let Some(mut s) = candidates
+            .into_iter()
+            .min_by_key(|s| (s.next_unix.unwrap_or(i64::MAX) - strap_unix).abs())
+        else {
             return Ok(());
-        }
-        for mut s in candidates {
-            s.last_rang_unix = Some(strap_unix);
-            s.next_unix = match s.kind.as_str() {
+        };
+        s.last_rang_unix = Some(strap_unix);
+        s.next_unix = match s.kind.as_str() {
+            "once" => {
+                s.enabled = false;
+                None
+            }
+            "cron" => s
+                .cron_expr
+                .as_deref()
+                .map(|expr| next_from_cron(expr, now, &s.timezone))
+                .transpose()?
+                .flatten(),
+            _ => None,
+        };
+        s.last_sent_unix = None;
+        s.updated_at = Utc::now().naive_utc();
+        self.save_alarm_schedule(s).await?;
+        Ok(())
+    }
+
+    /// Expire occurrences that are no longer safe to program on the strap.
+    /// Expiration is deliberately distinct from a confirmed strap alarm event.
+    pub async fn expire_past_alarm_schedules(&self, now_unix: i64) -> anyhow::Result<usize> {
+        let due = alarm_schedules::Entity::find()
+            .filter(alarm_schedules::Column::Enabled.eq(true))
+            .filter(alarm_schedules::Column::NextUnix.lt(now_unix))
+            .all(&self.db)
+            .await?;
+        let count = due.len();
+        for mut row in due {
+            if row.last_sent_unix.is_some() {
+                row.last_unconfirmed_unix = row.next_unix;
+            } else {
+                row.last_missed_unix = row.next_unix;
+            }
+            row.next_unix = match row.kind.as_str() {
                 "once" => {
-                    s.enabled = false;
+                    row.enabled = false;
                     None
                 }
-                "cron" => {
-                    if let Some(expr) = s.cron_expr.as_ref() {
-                        next_from_cron(expr, now + 1)?
-                    } else {
-                        None
-                    }
-                }
+                "cron" => row
+                    .cron_expr
+                    .as_deref()
+                    .map(|expr| next_from_cron(expr, now_unix, &row.timezone))
+                    .transpose()?
+                    .flatten(),
                 _ => None,
             };
-            s.updated_at = Utc::now().naive_utc();
-            let am: alarm_schedules::ActiveModel = s.into();
-            let _ = am.update(&self.db).await?;
+            row.last_sent_unix = None;
+            row.updated_at = Utc::now().naive_utc();
+            self.save_alarm_schedule(row).await?;
         }
-        Ok(())
+        Ok(count)
     }
 
     pub async fn next_enabled_alarm_unix(&self, now_unix: i64) -> anyhow::Result<Option<i64>> {
@@ -391,8 +618,7 @@ impl DatabaseHandler {
         for mut row in rows {
             row.last_sent_unix = Some(Utc::now().timestamp());
             row.updated_at = Utc::now().naive_utc();
-            let am: alarm_schedules::ActiveModel = row.into();
-            let _ = am.update(&self.db).await?;
+            self.save_alarm_schedule(row).await?;
         }
         Ok(())
     }
@@ -481,11 +707,17 @@ impl DatabaseHandler {
     }
 }
 
-fn next_from_cron(expr: &str, from_unix: i64) -> anyhow::Result<Option<i64>> {
+fn next_from_cron(expr: &str, from_unix: i64, timezone: &str) -> anyhow::Result<Option<i64>> {
     let sched = parse_cron_schedule(expr)?;
+    let tz: Tz = timezone
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid IANA timezone: {timezone}"))?;
     let from = chrono::DateTime::<Utc>::from_timestamp(from_unix, 0)
         .ok_or_else(|| anyhow::anyhow!("invalid from_unix"))?;
-    Ok(sched.after(&from).next().map(|dt| dt.timestamp()))
+    Ok(sched
+        .after(&from.with_timezone(&tz))
+        .next()
+        .map(|dt| dt.timestamp()))
 }
 
 fn parse_cron_schedule(expr: &str) -> anyhow::Result<Schedule> {
@@ -701,5 +933,157 @@ mod tests {
 
         assert_eq!(pending1.len(), 2);
         assert_eq!(pending2.len(), 1);
+    }
+
+    #[test]
+    fn daily_alarm_keeps_local_hour_across_dst() {
+        let march_7 = chrono::DateTime::parse_from_rfc3339("2026-03-07T13:00:00Z")
+            .unwrap()
+            .timestamp();
+        let next = next_from_cron("0 7 * * *", march_7, "America/New_York")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next,
+            chrono::DateTime::parse_from_rfc3339("2026-03-08T11:00:00Z")
+                .unwrap()
+                .timestamp()
+        );
+
+        let october_31 = chrono::DateTime::parse_from_rfc3339("2026-10-31T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        let next = next_from_cron("0 7 * * *", october_31, "America/New_York")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next,
+            chrono::DateTime::parse_from_rfc3339("2026-11-01T12:00:00Z")
+                .unwrap()
+                .timestamp()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_alarm_is_missed_and_never_rang() {
+        let db = DatabaseHandler::new("sqlite::memory:").await;
+        let now = Utc::now().timestamp();
+        let alarm = db
+            .create_alarm_schedule(AlarmScheduleDraft {
+                label: "test".into(),
+                kind: "once".into(),
+                cron_expr: None,
+                timezone: Some("America/New_York".into()),
+                one_time_unix: Some(now + 3600),
+            })
+            .await
+            .unwrap();
+        let mut row: alarm_schedules::ActiveModel = alarm.into();
+        row.next_unix = Set(Some(now - 60));
+        row.update(db.connection()).await.unwrap();
+
+        assert_eq!(db.expire_past_alarm_schedules(now).await.unwrap(), 1);
+        let stored = db.list_alarm_schedules().await.unwrap().pop().unwrap();
+        assert!(!stored.enabled);
+        assert_eq!(stored.last_missed_unix, Some(now - 60));
+        assert_eq!(stored.last_rang_unix, None);
+        assert_eq!(db.next_enabled_alarm_unix(now).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn strap_event_only_completes_closest_alarm() {
+        let db = DatabaseHandler::new("sqlite::memory:").await;
+        let now = Utc::now().timestamp();
+        for (label, unix) in [("first", now + 3600), ("second", now + 3620)] {
+            db.create_alarm_schedule(AlarmScheduleDraft {
+                label: label.into(),
+                kind: "once".into(),
+                cron_expr: None,
+                timezone: Some("America/New_York".into()),
+                one_time_unix: Some(unix),
+            })
+            .await
+            .unwrap();
+        }
+        db.mark_alarm_rang(now + 3600).await.unwrap();
+        let rows = db.list_alarm_schedules().await.unwrap();
+        assert!(!rows.iter().find(|r| r.label == "first").unwrap().enabled);
+        assert!(rows.iter().find(|r| r.label == "second").unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn programmed_alarm_without_event_is_unconfirmed_not_missed() {
+        let db = DatabaseHandler::new("sqlite::memory:").await;
+        let now = Utc::now().timestamp();
+        let alarm = db
+            .create_alarm_schedule(AlarmScheduleDraft {
+                label: "test".into(),
+                kind: "once".into(),
+                cron_expr: None,
+                timezone: Some("America/New_York".into()),
+                one_time_unix: Some(now + 3600),
+            })
+            .await
+            .unwrap();
+        let mut row: alarm_schedules::ActiveModel = alarm.into();
+        row.next_unix = Set(Some(now - 60));
+        row.last_sent_unix = Set(Some(now - 3600));
+        row.update(db.connection()).await.unwrap();
+
+        db.expire_past_alarm_schedules(now).await.unwrap();
+        let stored = db.list_alarm_schedules().await.unwrap().pop().unwrap();
+        assert_eq!(stored.last_unconfirmed_unix, Some(now - 60));
+        assert_eq!(stored.last_missed_unix, None);
+        assert_eq!(stored.last_rang_unix, None);
+    }
+
+    #[tokio::test]
+    async fn cloud_hr_outbox_keeps_samples_until_acknowledged() {
+        let db = DatabaseHandler::new("sqlite::memory:").await;
+        db.enqueue_cloud_hr_sample(1_700_000_000_000, 73, 1_700_000_000_100)
+            .await
+            .unwrap();
+        assert_eq!(db.pending_cloud_hr_samples(100).await.unwrap().len(), 1);
+        db.mark_cloud_hr_synced(&[1_700_000_000_000]).await.unwrap();
+        assert!(db.pending_cloud_hr_samples(100).await.unwrap().is_empty());
+        // A corrected sample must be uploaded again.
+        db.enqueue_cloud_hr_sample(1_700_000_000_000, 74, 1_700_000_000_200)
+            .await
+            .unwrap();
+        let rows = db.pending_cloud_hr_samples(100).await.unwrap();
+        assert_eq!(rows[0].bpm, 74);
+    }
+
+    #[tokio::test]
+    async fn cloud_alarm_toggle_and_delete_reconcile_locally() {
+        let db = DatabaseHandler::new("sqlite::memory:").await;
+        let mut remote = CloudAlarmInput {
+            id: Uuid::new_v4(),
+            label: "first".into(),
+            kind: "once".into(),
+            cron_expr: None,
+            timezone: "America/New_York".into(),
+            one_time_unix: Some(Utc::now().timestamp() + 3600),
+            enabled: true,
+        };
+        db.reconcile_cloud_alarms(&[remote.clone()]).await.unwrap();
+        let first = db.list_alarm_schedules().await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].cloud_id, Some(remote.id));
+        assert!(first[0].enabled);
+        remote.enabled = false;
+        db.reconcile_cloud_alarms(&[remote.clone()]).await.unwrap();
+        let off = db.list_alarm_schedules().await.unwrap();
+        assert!(!off[0].enabled);
+        assert_eq!(off[0].next_unix, None);
+        remote.enabled = true;
+        db.reconcile_cloud_alarms(&[remote]).await.unwrap();
+        assert!(
+            db.list_alarm_schedules().await.unwrap()[0]
+                .next_unix
+                .is_some()
+        );
+        db.reconcile_cloud_alarms(&[]).await.unwrap();
+        assert!(db.list_alarm_schedules().await.unwrap().is_empty());
     }
 }
