@@ -55,6 +55,17 @@ function displayTime(time: string): string {
   return new Date(2020, 0, 1, hour, minute).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
+function clockParts(time: string) {
+  const [hour24, minute] = time.split(":").map(Number);
+  return { hour: String(hour24 % 12 || 12), minute: String(minute).padStart(2, "0"), period: hour24 >= 12 ? "PM" : "AM" };
+}
+
+function changeClockPart(time: string, part: "hour" | "minute" | "period", value: string): string {
+  const next = { ...clockParts(time), [part]: value };
+  const hour24 = Number(next.hour) % 12 + (next.period === "PM" ? 12 : 0);
+  return `${String(hour24).padStart(2, "0")}:${next.minute}`;
+}
+
 function repeatLabel(days: number[]): string {
   if (days.length === 7) return "Every day";
   if (days.join(",") === "1,2,3,4,5") return "Weekdays";
@@ -215,7 +226,17 @@ export default function HostedDashboard() {
       <section className="alarm-heading"><p>{!nextAlarm ? "No alarm armed" : onStrap ? `Synced to Whoop · ${displayTime(cronParts(nextAlarm).time)}` : macOnline ? "Checking Whoop alarm…" : "Mac offline · waiting to sync"}</p>
         <button className="add-alarm" onClick={() => setDraft(blankDraft())}>+ Add</button></section>
       {draft && <section className="panel alarm-editor"><div className="editor-title"><h2>{draft.id ? "Edit alarm" : "New alarm"}</h2><button className="text-button" onClick={() => setDraft(null)}>Cancel</button></div>
-        <label className="time-field">Time<input type="time" required value={draft.time} onChange={event => setDraft({ ...draft, time: event.target.value })} /></label>
+        <div className="time-field"><span>Time</span><div className="time-picker" role="group" aria-label="Alarm time">
+          <select aria-label="Hour" value={clockParts(draft.time).hour} onChange={event => setDraft({ ...draft, time: changeClockPart(draft.time, "hour", event.target.value) })}>
+            {Array.from({ length: 12 }, (_, index) => <option key={index + 1} value={index + 1}>{index + 1}</option>)}
+          </select><span aria-hidden="true">:</span>
+          <select aria-label="Minute" value={clockParts(draft.time).minute} onChange={event => setDraft({ ...draft, time: changeClockPart(draft.time, "minute", event.target.value) })}>
+            {Array.from({ length: 60 }, (_, index) => String(index).padStart(2, "0")).map(minute => <option key={minute} value={minute}>{minute}</option>)}
+          </select>
+          <select aria-label="AM or PM" value={clockParts(draft.time).period} onChange={event => setDraft({ ...draft, time: changeClockPart(draft.time, "period", event.target.value) })}>
+            <option value="AM">AM</option><option value="PM">PM</option>
+          </select>
+        </div></div>
         <details className="repeat-settings"><summary>Repeat <span>{repeatLabel(draft.days)}</span></summary>
           <div className="days">{DAYS.map((name, index) => <button key={name} type="button" className={draft.days.includes(index) ? "selected" : ""}
             aria-pressed={draft.days.includes(index)} onClick={() => setDraft({ ...draft,
