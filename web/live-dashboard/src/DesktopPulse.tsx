@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { ResponsiveContainer, ComposedChart, Line, Area, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import "./desktop-pulse.css";
@@ -17,7 +17,7 @@ function duration(minutes: number) { const total = Math.round(minutes); return t
 function clock(ms: number) { return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); }
 function dayKey(ms: number) { return localValue(ms).slice(0, 10); }
 
-export default function DesktopPulse({ client, owner }: { client: SupabaseClient; owner: string }) {
+function DesktopPulse({ client, owner }: { client: SupabaseClient; owner: string }) {
   const [span, setSpan] = useState<keyof typeof spans | "custom">("1h");
   const [anchor, setAnchor] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -93,3 +93,5 @@ export default function DesktopPulse({ client, owner }: { client: SupabaseClient
     </div>
   </div>;
 }
+
+export default memo(DesktopPulse);
